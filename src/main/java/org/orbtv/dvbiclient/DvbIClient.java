@@ -1043,10 +1043,29 @@ public class DvbIClient {
      * service instance and select the next (HbbTV O.3 / ERRATA0600–0630).
      */
     public void onLinkedApp12StartFailed(String reason) {
+        discardLinkedApp12Instance("cannot start (" + reason + ")", true);
+    }
+
+    /**
+     * Type 1.2 app explicitly exited (Application.destroyApplication). Discard this
+     * service instance and select the next (TS 103 770 §5.2.13 / errata #13697).
+     * The application is already killed; do not restart it on this instance.
+     */
+    public void onLinkedApp12ExplicitlyExited() {
+        discardLinkedApp12Instance("explicit destroyApplication", false);
+    }
+
+    /**
+     * Discard the current LA 1.2 instance and select the next remaining instance.
+     *
+     * @param killRunningApp if true, tear down the running HbbTV app and native media
+     *        first (start-failure path). False when the app already exited.
+     */
+    private void discardLinkedApp12Instance(String reason, boolean killRunningApp) {
         ServiceInstance current = mServiceManager.getTunedInstance();
         Service service = mServiceManager.getTunedService();
         if (current == null || service == null) {
-            Log.w(TAG, "LA12_FAIL: no tuned instance (" + reason + ")");
+            Log.w(TAG, "LA12_DISCARD: no tuned instance (" + reason + ")");
             return;
         }
         DvbIChannelAdapter channel = new DvbIChannelAdapter.Builder()
@@ -1054,17 +1073,19 @@ public class DvbIClient {
                 .setServiceInstance(current)
                 .build();
         if (channel == null || channel.getLinkedAppUri(LINKED_APP_SCHEME_1_2) == null) {
-            Log.i(TAG, "LA12_FAIL: current instance is not LA 1.2; ignoring (" + reason + ")");
+            Log.i(TAG, "LA12_DISCARD: current instance is not LA 1.2; ignoring (" + reason + ")");
             return;
         }
-        Log.i(TAG, "LA12_FAIL: cannot start (" + reason + "); discarding instance");
+        Log.i(TAG, "LA12_DISCARD: " + reason);
         mPendingLinkedAppUrl = null;
         mPendingLinkedAppScheme = null;
-        mTvInputCallback.destroyHbbtvApplication();
-        mDvbIView.tuneOff();
-        mTvInputCallback.tuneOffBroadcast();
+        if (killRunningApp) {
+            mTvInputCallback.destroyHbbtvApplication();
+            mDvbIView.tuneOff();
+            mTvInputCallback.tuneOffBroadcast();
+        }
         if (!mServiceManager.discardCurrentInstanceAndReselect()) {
-            Log.w(TAG, "LA12_FAIL: discard/reselect did not change instance");
+            Log.w(TAG, "LA12_DISCARD: discard/reselect did not change instance (" + reason + ")");
         }
     }
 
