@@ -181,9 +181,10 @@ public class TunedServiceManager {
      * exited) and the next selectable instance is chosen.
      * No-op if the application has pinned an instance (O.5.4 / ERRATA0400).
      *
+     * @param reason why discard was requested (start-failure, explicit exit, …)
      * @return true if a discard/reselect was performed
      */
-    public boolean discardCurrentInstanceAndReselect() {
+    public boolean discardCurrentInstanceAndReselect(String reason) {
         ServiceInstance from;
         ServiceInstance next;
         synchronized (mLock) {
@@ -191,7 +192,8 @@ public class TunedServiceManager {
                 return false;
             }
             if (mTunedServiceRunnable != null && mTunedServiceRunnable.mTargetInstance != null) {
-                Log.i(TAG, "LA12_DISCARD: not discarding app-pinned instance");
+                Log.i(TAG, "LA12_DISCARD: O.5.4 pin held after " + reason
+                        + "; staying on current instance (ERRATA0400)");
                 return false;
             }
             from = mTunedInstance;

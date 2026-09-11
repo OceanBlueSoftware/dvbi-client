@@ -1058,8 +1058,9 @@ public class DvbIClient {
     /**
      * Discard the current LA 1.2 instance and select the next remaining instance.
      *
-     * @param killRunningApp if true, tear down the running HbbTV app and native media
-     *        first (start-failure path). False when the app already exited.
+     * @param killRunningApp if true, also kill the HbbTV app (XML AIT / first-page
+     *        start-failure). False when destroyApplication() already exited the app;
+     *        do not call destroyHbbtvApplication() in that case (parental kill).
      */
     private void discardLinkedApp12Instance(String reason, boolean killRunningApp) {
         ServiceInstance current = mServiceManager.getTunedInstance();
@@ -1081,10 +1082,15 @@ public class DvbIClient {
         mPendingLinkedAppScheme = null;
         if (killRunningApp) {
             mTvInputCallback.destroyHbbtvApplication();
-            mDvbIView.tuneOff();
-            mTvInputCallback.tuneOffBroadcast();
         }
-        if (!mServiceManager.discardCurrentInstanceAndReselect()) {
+        // Native DASH/RF and any A.2.4.1 decoder hold must be released before the
+        // next instance presents. After destroyApplication() the WebView is
+        // about:blank, so JS will not call setPresentationSuspended(false).
+        clearPendingNativePresentation();
+        mDvbIView.tuneOff();
+        mTvInputCallback.tuneOffBroadcast();
+        setPresentationSuspended(false);
+        if (!mServiceManager.discardCurrentInstanceAndReselect(reason)) {
             Log.w(TAG, "LA12_DISCARD: discard/reselect did not change instance (" + reason + ")");
         }
     }
@@ -1100,7 +1106,7 @@ public class DvbIClient {
             Log.w(TAG, "LA12_RESTART: no tuned instance at restart limit");
             return;
         }
-        if (!mServiceManager.discardCurrentInstanceAndReselect()) {
+        if (!mServiceManager.discardCurrentInstanceAndReselect("restart limit")) {
             Log.w(TAG, "LA12_RESTART: no other instance; keeping current (O.3)");
         }
     }
