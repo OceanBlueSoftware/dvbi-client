@@ -176,13 +176,15 @@ public class TunedServiceManager {
     }
 
     /**
-     * HbbTV O.3 / TS 103 770 §5.2.13: LA 1.2 could not be started, so this instance is discarded
-     * for the current selection attempt and the next selectable instance is chosen.
+     * HbbTV O.3 / TS 103 770 §5.2.13: this instance is discarded for the current
+     * selection attempt (LA 1.2 could not start, or a type 1.2 app explicitly
+     * exited) and the next selectable instance is chosen.
      * No-op if the application has pinned an instance (O.5.4 / ERRATA0400).
      *
+     * @param reason why discard was requested (start-failure, explicit exit, …)
      * @return true if a discard/reselect was performed
      */
-    public boolean discardCurrentInstanceAndReselect() {
+    public boolean discardCurrentInstanceAndReselect(String reason) {
         ServiceInstance from;
         ServiceInstance next;
         synchronized (mLock) {
@@ -190,13 +192,14 @@ public class TunedServiceManager {
                 return false;
             }
             if (mTunedServiceRunnable != null && mTunedServiceRunnable.mTargetInstance != null) {
-                Log.i(TAG, "LA12_FAIL: not discarding app-pinned instance");
+                Log.i(TAG, "LA12_DISCARD: O.5.4 pin held after " + reason
+                        + "; staying on current instance (ERRATA0400)");
                 return false;
             }
             from = mTunedInstance;
             mDiscardedInstances.add(from);
             next = getMaxPriorityInstance(mTunedService);
-            Log.i(TAG, "LA12_FAIL: discarded instance, next="
+            Log.i(TAG, "LA12_DISCARD: discarded instance, next="
                     + (next == null ? "none" : next.getDeliveryType()));
             if (next == from) {
                 return false;

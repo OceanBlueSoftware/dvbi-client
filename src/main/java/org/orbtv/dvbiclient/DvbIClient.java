@@ -1043,10 +1043,30 @@ public class DvbIClient {
      * service instance and select the next (HbbTV O.3 / ERRATA0600–0630).
      */
     public void onLinkedApp12StartFailed(String reason) {
+        discardLinkedApp12Instance("cannot start (" + reason + ")", true);
+    }
+
+    /**
+     * Type 1.2 app explicitly exited (Application.destroyApplication). Discard this
+     * service instance and select the next (TS 103 770 §5.2.13 / errata #13697).
+     * The application is already killed; do not restart it on this instance.
+     */
+    public void onLinkedApp12ExplicitlyExited() {
+        discardLinkedApp12Instance("explicit destroyApplication", false);
+    }
+
+    /**
+     * Discard the current LA 1.2 instance and select the next remaining instance.
+     *
+     * @param killRunningApp if true, also kill the HbbTV app (XML AIT / first-page
+     *        start-failure). False when destroyApplication() already exited the app;
+     *        do not call destroyHbbtvApplication() in that case (parental kill).
+     */
+    private void discardLinkedApp12Instance(String reason, boolean killRunningApp) {
         ServiceInstance current = mServiceManager.getTunedInstance();
         Service service = mServiceManager.getTunedService();
         if (current == null || service == null) {
-            Log.w(TAG, "LA12_FAIL: no tuned instance (" + reason + ")");
+            Log.w(TAG, "LA12_DISCARD: no tuned instance (" + reason + ")");
             return;
         }
         DvbIChannelAdapter channel = new DvbIChannelAdapter.Builder()
@@ -1054,17 +1074,24 @@ public class DvbIClient {
                 .setServiceInstance(current)
                 .build();
         if (channel == null || channel.getLinkedAppUri(LINKED_APP_SCHEME_1_2) == null) {
-            Log.i(TAG, "LA12_FAIL: current instance is not LA 1.2; ignoring (" + reason + ")");
+            Log.i(TAG, "LA12_DISCARD: current instance is not LA 1.2; ignoring (" + reason + ")");
             return;
         }
-        Log.i(TAG, "LA12_FAIL: cannot start (" + reason + "); discarding instance");
+        Log.i(TAG, "LA12_DISCARD: " + reason);
         mPendingLinkedAppUrl = null;
         mPendingLinkedAppScheme = null;
-        mTvInputCallback.destroyHbbtvApplication();
+        if (killRunningApp) {
+            mTvInputCallback.destroyHbbtvApplication();
+        }
+        // Native DASH/RF and any A.2.4.1 decoder hold must be released before the
+        // next instance presents. After destroyApplication() the WebView is
+        // about:blank, so JS will not call setPresentationSuspended(false).
+        clearPendingNativePresentation();
         mDvbIView.tuneOff();
         mTvInputCallback.tuneOffBroadcast();
-        if (!mServiceManager.discardCurrentInstanceAndReselect()) {
-            Log.w(TAG, "LA12_FAIL: discard/reselect did not change instance");
+        setPresentationSuspended(false);
+        if (!mServiceManager.discardCurrentInstanceAndReselect(reason)) {
+            Log.w(TAG, "LA12_DISCARD: discard/reselect did not change instance (" + reason + ")");
         }
     }
 
@@ -1079,7 +1106,7 @@ public class DvbIClient {
             Log.w(TAG, "LA12_RESTART: no tuned instance at restart limit");
             return;
         }
-        if (!mServiceManager.discardCurrentInstanceAndReselect()) {
+        if (!mServiceManager.discardCurrentInstanceAndReselect("restart limit")) {
             Log.w(TAG, "LA12_RESTART: no other instance; keeping current (O.3)");
         }
     }
