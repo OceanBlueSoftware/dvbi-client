@@ -18,8 +18,10 @@ package org.orbtv.dvbiclient;
 
 import android.content.Context;
 import android.content.SharedPreferences;
+import android.net.Uri;
 import android.media.tv.TvInputManager;
 import android.media.tv.TvTrackInfo;
+import android.os.Handler;
 import android.os.Looper;
 import android.util.Log;
 import android.view.View;
@@ -47,17 +49,29 @@ import java.io.StringReader;
 import java.net.HttpURLConnection;
 import java.net.URL;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashMap;
+import java.util.HashSet;
+import java.util.Iterator;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Set;
 import java.util.Timer;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 public class DvbIClient {
     private static DvbIClient mSingleton;
     private static final String TAG = DvbIClient.class.getSimpleName();
     private static final String PREF_DVBI_SERVICE_LIST_VERSION = "dvbi_service_list_version";
     private static final String PREF_DVBI_SERVICE_LIST_URL = "dvbi_service_list_url";
+    /** UIDs that already completed type 4.1 install (TS 103 770 §5.2.3.6.1 Note 2). Not 4.2/4.3. */
+    private static final String PREF_LA41_COMPLETED_UIDS = "dvbi_la41_completed_uids";
+    private static final String PREF_LA41_QUERY_PREFIX = "dvbi_la41_query:";
+    private static final long TYPE_41_INSTALL_TIMEOUT_MS = 60_000L;
+    private static final Pattern APPLICATION_LOCATION = Pattern.compile(
+            "(?i)(<(?:[\\w.-]+:)?applicationLocation(?:\\s[^>]*)?>)([^<]*)(</(?:[\\w.-]+:)?applicationLocation>)");
 
     public static final String TYPE_DVB_I = "TYPE_DVB_I";
     public static final String TYPE_OTHER = "TYPE_OTHER";
@@ -131,6 +145,15 @@ public class DvbIClient {
     private String mPendingLinkedAppScheme;
     private volatile LinkedAppCompletion mLastLinkedAppCompletion;
     private volatile LinkedAppJsonRpcListener mLinkedAppJsonRpcListener;
+    private volatile boolean mInstallGateActive = false;
+    private final Handler mMainHandler = new Handler(Looper.getMainLooper());
+    private final Runnable mInstallGateTimeout = this::onType41InstallTimeout;
+    private ServiceList mPendingServiceList;
+    private String mPendingServiceListUri;
+    private String mPendingServiceListXml;
+    private final List<QueryPair> mInstallQueryPairs = new ArrayList<>();
+    private String mPendingRenewUrl;
+    private String mInstallationToken;
     /** App-pinned instance is outside its Availability Period; ignore DASH PLAYING until it returns. */
     private volatile boolean mPinnedInstanceOutsideWindow = false;
     /** App (LA 1.2 / A/V Control) holds AV decoders; native DASH/RF must wait (A.2.4.1). */
@@ -181,7 +204,7 @@ public class DvbIClient {
                         handleLinkedApp1_2(channel, app_1_2, service);
                     } else {
                         if (dashUri != null) {
-                            uri = dashUri;
+                            uri = applyInstallQuery(dashUri);
                         }
                         handleNativeOrLinkedApp1_1(channel, toInstance, service, uri);
                     }
@@ -1461,22 +1484,22 @@ public class DvbIClient {
     }
 
     public boolean startServiceSearch(String serviceListURL) {
-        boolean ret = false;
-        if (mLastDiscoveryTask == null) {
-            mLastDiscoveryTask = new ServiceListDiscoveryTask();
-            if (serviceListURL == null || serviceListURL.isEmpty()) {
-                // Default to HbbTV test harness service list URL for test environment
-                serviceListURL = "http://hbbtv1.test/servicelist.xml";
-            }
-            mLastDiscoveryTask = new ServiceListDiscoveryTask();
-            Log.d(TAG, "Starting service search at " + serviceListURL);
-            //mLastDiscoveryTask.execute("http://stage.sofiadigital.fi/dvb/dvb-i-reference-application/backend/servicelists/example.xml?ts=1689243059951");
-            //mLastDiscoveryTask.execute("http://192.168.1.145/config.xml");
-            //mLastDiscoveryTask.execute("http://stage.sofiadigital.fi/dvb/dvb-i-reference-application/backend/servicelists/SofiaTestList.xml?ts=1689686736811"); //+app
-            mLastDiscoveryTask.execute(serviceListURL);
-            ret = true;
+        if (mInstallGateActive) {
+            Log.w(TAG, "Cancelling in-progress type 4.1 install gate to start a new search");
+            cancelType41InstallGate();
         }
-        return ret;
+        ServiceListDiscoveryTask previous = mLastDiscoveryTask;
+        mLastDiscoveryTask = new ServiceListDiscoveryTask();
+        if (previous != null) {
+            previous.cancel(true);
+        }
+        if (serviceListURL == null || serviceListURL.isEmpty()) {
+            // Default to HbbTV test harness service list URL for test environment
+            serviceListURL = "http://hbbtv1.test/servicelist.xml";
+        }
+        Log.d(TAG, "Starting service search at " + serviceListURL);
+        mLastDiscoveryTask.execute(serviceListURL);
+        return true;
     }
 
     /**
@@ -1836,6 +1859,9 @@ public class DvbIClient {
     private class ServiceListDiscoveryTask extends AsyncUtils<Void, String> {
         @Override
         protected Void doInBackground(String... uris) {
+            mPendingServiceList = null;
+            mPendingServiceListUri = null;
+            mPendingServiceListXml = null;
             try {
                 for (String uri : uris) {
                     URL url = new URL(uri);
@@ -1878,20 +1904,11 @@ public class DvbIClient {
                     String targetRegion = "";
                     ServiceList serviceList = ServiceList.parseFromXML(uri, responseBuilder.toString(), targetRegion);
 
-                    //for (Service service : serviceList.getServices()) {
-                    //    Log.d(TAG, "--------- scanned service ----------\n" + service);
-                    //}
-                    mDbHandler.updateServiceList(serviceList);
-
-                    // Extract and save version from the loaded XML
-                    if (mCurrentServiceListUrl != null && uri.equals(mCurrentServiceListUrl)) {
-                        String version = extractVersionFromXml(responseBuilder.toString());
-                        if (version != null) {
-                            saveServiceListVersion(uri, version);
-                        }
-                    }
+                    // Hold the parsed list until the type 4.1 gate (if any) completes.
+                    mPendingServiceList = serviceList;
+                    mPendingServiceListUri = uri;
+                    mPendingServiceListXml = responseBuilder.toString();
                 }
-                mEpgManager.refreshServiceLists();
             }
             catch(IOException e) {
                 Log.e(TAG, "Error sending request", e);
@@ -1904,34 +1921,45 @@ public class DvbIClient {
 
         @Override
         public void onPostExecute(Void success) {
-            finalizeSearch();
+            RelatedMaterial type41 = findType41App(mPendingServiceList);
+            if (type41 != null && hasCompletedType41Install(mPendingServiceList)) {
+                Log.i(TAG, "Type 4.1 already completed for list UID "
+                        + mPendingServiceList.getUID() + " — skipping install gate");
+                restoreType41QueryPairs(mPendingServiceList);
+                commitPendingServiceList();
+                finalizeSearch();
+            } else if (type41 != null) {
+                startType41InstallGate(type41);
+            } else {
+                commitPendingServiceList();
+                finalizeSearch();
+            }
         }
 
         @Override
         public void onCancelled(Void ignore) {
-            finalizeSearch();
-        }
-
-        private synchronized void finalizeSearch() {
-            Log.d(TAG, "finalizeSearch: Service list discovery completed, triggering callbacks");
-            mLastDiscoveryTask = null; // Reset so new searches can be started
-            mCurrentServiceListUrl = null; // Clear tracked URL
-            for (DvbCallback handler : mDvbCallbacks) {
-                handler.onDvbtStatusChanged(100);
+            discardPendingServiceList();
+            if (mLastDiscoveryTask == this) {
+                finalizeSearch();
             }
-            // Trigger channel sync after service list is loaded/updated
-            // This ensures DVB-I channels are added to TV Contract so they appear in the channel list
-            Log.d(TAG, "finalizeSearch: Triggering onServiceAdded() to sync channels. Callback count: " + mDvbCallbacks.size());
-            for (DvbCallback handler : mDvbCallbacks) {
-                handler.onServiceAdded();
-            }
-            // Service-list ParentalRating may have changed (ERRATA0310).
-            onParentalControlAgeChanged();
-
-            //TOREMOVE
-//            String serviceUniqueIdentifier = "tag:sofiadigital.com,2023:org.hbbtv_DVBI_VBO0200-1";
-//            ContentGuide.getEpgMetadata(serviceUniqueIdentifier, "", "", "", "true");
         }
+    }
+
+    private synchronized void finalizeSearch() {
+        Log.d(TAG, "finalizeSearch: Service list discovery completed, triggering callbacks");
+        mLastDiscoveryTask = null; // Reset so new searches can be started
+        mCurrentServiceListUrl = null; // Clear tracked URL
+        for (DvbCallback handler : mDvbCallbacks) {
+            handler.onDvbtStatusChanged(100);
+        }
+        // Trigger channel sync after service list is loaded/updated
+        // This ensures DVB-I channels are added to TV Contract so they appear in the channel list
+        Log.d(TAG, "finalizeSearch: Triggering onServiceAdded() to sync channels. Callback count: " + mDvbCallbacks.size());
+        for (DvbCallback handler : mDvbCallbacks) {
+            handler.onServiceAdded();
+        }
+        // Service-list ParentalRating may have changed (ERRATA0310).
+        onParentalControlAgeChanged();
     }
 
     private class GetXmlAitTask extends AsyncUtils<XmlAitAttributes, XmlAitAttributes> {
@@ -1975,7 +2003,7 @@ public class DvbIClient {
             }
             // ERRATA0900: a previous instance's XML AIT must not land after setChannel
             // to another instance (re-lock 1.2 → 1.1 applied scheme 1.2 and CCS).
-            if (result.generation != mTuneGeneration) {
+            if (result.generation >= 0 && result.generation != mTuneGeneration) {
                 Log.i(TAG, "Ignoring stale XML AIT scheme=" + result.scheme
                     + " gen=" + result.generation + " current=" + mTuneGeneration);
                 return;
@@ -1985,8 +2013,14 @@ public class DvbIClient {
                 if (LINKED_APP_SCHEME_1_2.equals(result.scheme)) {
                     onLinkedApp12StartFailed("XML AIT fetch failed");
                 }
+                if (LINKED_APP_SCHEME_4_1.equals(result.scheme) && mInstallGateActive) {
+                    Log.e(TAG, "Type 4.1 XML AIT fetch failed — cancelling install gate");
+                    discardPendingServiceList();
+                    finishType41InstallGate();
+                }
                 return;
             }
+            result.xml = applyLaunchContextToXmlAit(result.xml, result.scheme);
             for (Callback cb : mCallbacks) {
                 cb.onProcessXmlAit(result.xml, result.scheme);
             }
@@ -2057,6 +2091,330 @@ public class DvbIClient {
         public String getLabel() { return label; }
     }
 
+    private static final class QueryPair {
+        final String key;
+        final String value;
+        QueryPair(String key, String value) {
+            this.key = key;
+            this.value = value != null ? value : "";
+        }
+    }
+
+    private static RelatedMaterial findType41App(ServiceList list) {
+        if (list == null) {
+            return null;
+        }
+        RelatedMaterial found = findType41App(list.getRelatedMaterials());
+        if (found != null) {
+            return found;
+        }
+        for (Service service : list.getServices()) {
+            found = findType41App(service.getRelatedMaterials());
+            if (found != null) {
+                return found;
+            }
+        }
+        return null;
+    }
+
+    private static RelatedMaterial findType41App(List<RelatedMaterial> materials) {
+        if (materials == null) {
+            return null;
+        }
+        for (RelatedMaterial rm : materials) {
+            if (LINKED_APP_SCHEME_4_1.equals(rm.getHowRelatedHref())
+                    && rm.getMediaLocatorUri() != null
+                    && !rm.getMediaLocatorUri().isEmpty()) {
+                return rm;
+            }
+        }
+        return null;
+    }
+
+    private void startType41InstallGate(RelatedMaterial type41) {
+        mInstallGateActive = true;
+        Log.i(TAG, "Type 4.1 install gate: " + type41.getMediaLocatorUri());
+        mMainHandler.removeCallbacks(mInstallGateTimeout);
+        mMainHandler.postDelayed(mInstallGateTimeout, TYPE_41_INSTALL_TIMEOUT_MS);
+        setLinkedAppJsonRpcListener((method, paramsJson) -> {
+            if (!mInstallGateActive) {
+                return;
+            }
+            if (LA_SL_INSTALL_SUCCESS.equals(method)) {
+                applyInstallSuccessParams(paramsJson);
+                persistType41InstallSuccess(mPendingServiceList);
+                commitPendingServiceList();
+                finishType41InstallGate();
+            } else if (LA_SL_INSTALL_FAILURE.equals(method)) {
+                Log.i(TAG, "Type 4.1 sl_install_failure — discarding pending service list");
+                discardPendingServiceList();
+                finishType41InstallGate();
+            }
+        });
+        final String href = LINKED_APP_SCHEME_4_1;
+        Runnable publish = () -> {
+            for (Callback cb : mCallbacks) {
+                cb.onApplicationHowRelatedHrefChanged(href);
+            }
+        };
+        if (Looper.getMainLooper().isCurrentThread()) {
+            publish.run();
+        } else {
+            mMainHandler.post(publish);
+        }
+        launchType41App(type41);
+    }
+
+    private void launchType41App(RelatedMaterial type41) {
+        String url = type41.getMediaLocatorUri();
+        if (type41.isGenericHtmlContentType()) {
+            String launchUrl = appendQueryComponent(url, "lloc", "install");
+            for (Callback cb : mCallbacks) {
+                cb.onLaunchHtmlLinkedApp(launchUrl, LINKED_APP_SCHEME_4_1);
+            }
+        } else {
+            new GetXmlAitTask().execute(
+                    new XmlAitAttributes(url, LINKED_APP_SCHEME_4_1, mTuneGeneration));
+        }
+    }
+
+    private void onType41InstallTimeout() {
+        if (!mInstallGateActive) {
+            return;
+        }
+        Log.w(TAG, "Type 4.1 install gate timed out after " + TYPE_41_INSTALL_TIMEOUT_MS
+                + "ms — discarding pending service list");
+        discardPendingServiceList();
+        finishType41InstallGate();
+    }
+
+    /**
+     * Drop a hung or superseded 4.1 gate without emitting scan-complete. The caller is
+     * starting a replacement search whose finalizeSearch() will notify Setup.
+     */
+    private void cancelType41InstallGate() {
+        mMainHandler.removeCallbacks(mInstallGateTimeout);
+        mInstallGateActive = false;
+        setLinkedAppJsonRpcListener(null);
+        discardPendingServiceList();
+    }
+
+    private void finishType41InstallGate() {
+        mMainHandler.removeCallbacks(mInstallGateTimeout);
+        mInstallGateActive = false;
+        setLinkedAppJsonRpcListener(null);
+        finalizeSearch();
+    }
+
+    private void commitPendingServiceList() {
+        ServiceList list = mPendingServiceList;
+        String uri = mPendingServiceListUri;
+        String xml = mPendingServiceListXml;
+        mPendingServiceList = null;
+        mPendingServiceListUri = null;
+        mPendingServiceListXml = null;
+        if (list == null) {
+            return;
+        }
+        mDbHandler.updateServiceList(list);
+        if (mCurrentServiceListUrl != null && uri != null && uri.equals(mCurrentServiceListUrl) && xml != null) {
+            String version = extractVersionFromXml(xml);
+            if (version != null) {
+                saveServiceListVersion(uri, version);
+            }
+        }
+        mEpgManager.refreshServiceLists();
+    }
+
+    private void discardPendingServiceList() {
+        mPendingServiceList = null;
+        mPendingServiceListUri = null;
+        mPendingServiceListXml = null;
+        mInstallQueryPairs.clear();
+        mPendingRenewUrl = null;
+        mInstallationToken = null;
+    }
+
+    private void applyInstallSuccessParams(String paramsJson) {
+        mInstallQueryPairs.clear();
+        mPendingRenewUrl = null;
+        mInstallationToken = null;
+        try {
+            JSONObject params = new JSONObject(paramsJson != null ? paramsJson : "{}");
+            parseInstallQuery(params);
+            JSONObject response = params.optJSONObject("application_response");
+            if (response != null) {
+                if (response.has("renewurl")) {
+                    mPendingRenewUrl = response.optString("renewurl", null);
+                }
+                if (response.has("installationtoken")) {
+                    mInstallationToken = response.optString("installationtoken", null);
+                }
+            }
+        } catch (JSONException e) {
+            Log.w(TAG, "Type 4.1 success params were not JSON");
+        }
+    }
+
+    private void parseInstallQuery(JSONObject params) {
+        if (!params.has("query") || params.isNull("query")) {
+            return;
+        }
+        Object query = params.opt("query");
+        if (query instanceof JSONArray) {
+            JSONArray arr = (JSONArray) query;
+            for (int i = 0; i < arr.length(); i++) {
+                JSONObject item = arr.optJSONObject(i);
+                if (item == null) {
+                    continue;
+                }
+                String key = item.optString("key", null);
+                if (key == null || key.isEmpty()) {
+                    continue;
+                }
+                mInstallQueryPairs.add(new QueryPair(key, item.optString("value", "")));
+            }
+        } else if (query instanceof JSONObject) {
+            JSONObject obj = (JSONObject) query;
+            Iterator<String> keys = obj.keys();
+            while (keys.hasNext()) {
+                String key = keys.next();
+                if (key == null || key.isEmpty()) {
+                    continue;
+                }
+                mInstallQueryPairs.add(new QueryPair(key, obj.optString(key, "")));
+            }
+        } else {
+            Log.w(TAG, "Type 4.1 query was neither a JSON array nor object");
+        }
+    }
+
+    private boolean hasCompletedType41Install(ServiceList list) {
+        if (list == null || list.getUID() == null) {
+            return false;
+        }
+        SharedPreferences prefs = mDvbIView.getContext().getSharedPreferences("DvbIClient", Context.MODE_PRIVATE);
+        Set<String> done = prefs.getStringSet(PREF_LA41_COMPLETED_UIDS, Collections.emptySet());
+        return done != null && done.contains(list.getUID());
+    }
+
+    private void persistType41InstallSuccess(ServiceList list) {
+        if (list == null || list.getUID() == null) {
+            return;
+        }
+        SharedPreferences prefs = mDvbIView.getContext().getSharedPreferences("DvbIClient", Context.MODE_PRIVATE);
+        Set<String> done = new HashSet<>(prefs.getStringSet(PREF_LA41_COMPLETED_UIDS, Collections.emptySet()));
+        done.add(list.getUID());
+        prefs.edit()
+                .putStringSet(PREF_LA41_COMPLETED_UIDS, done)
+                .putString(PREF_LA41_QUERY_PREFIX + list.getUID(), queryPairsToJson())
+                .apply();
+        Log.i(TAG, "Persisted type 4.1 install completion for list UID " + list.getUID());
+    }
+
+    private void restoreType41QueryPairs(ServiceList list) {
+        mInstallQueryPairs.clear();
+        if (list == null || list.getUID() == null) {
+            return;
+        }
+        SharedPreferences prefs = mDvbIView.getContext().getSharedPreferences("DvbIClient", Context.MODE_PRIVATE);
+        String json = prefs.getString(PREF_LA41_QUERY_PREFIX + list.getUID(), null);
+        if (json == null || json.isEmpty()) {
+            return;
+        }
+        try {
+            JSONArray arr = new JSONArray(json);
+            for (int i = 0; i < arr.length(); i++) {
+                JSONObject item = arr.optJSONObject(i);
+                if (item == null) {
+                    continue;
+                }
+                String key = item.optString("key", null);
+                if (key == null || key.isEmpty()) {
+                    continue;
+                }
+                mInstallQueryPairs.add(new QueryPair(key, item.optString("value", "")));
+            }
+        } catch (JSONException e) {
+            Log.w(TAG, "Stored type 4.1 query was not JSON");
+        }
+    }
+
+    private String queryPairsToJson() {
+        JSONArray arr = new JSONArray();
+        for (QueryPair pair : mInstallQueryPairs) {
+            try {
+                JSONObject item = new JSONObject();
+                item.put("key", pair.key);
+                item.put("value", pair.value);
+                arr.put(item);
+            } catch (JSONException ignored) {
+            }
+        }
+        return arr.toString();
+    }
+
+    /**
+     * §5.2.3.6.1: lloc=install and success query pairs belong on AIT applicationLocation
+     * (and DASH MPD URLs), not on the XML AIT fetch URL.
+     */
+    private String applyLaunchContextToXmlAit(String xml, String scheme) {
+        if (xml == null) {
+            return null;
+        }
+        boolean llocInstall = LINKED_APP_SCHEME_4_1.equals(scheme);
+        boolean installQuery = !mInstallQueryPairs.isEmpty();
+        if (!llocInstall && !installQuery) {
+            return xml;
+        }
+        Matcher matcher = APPLICATION_LOCATION.matcher(xml);
+        StringBuffer rewritten = new StringBuffer();
+        boolean found = false;
+        while (matcher.find()) {
+            found = true;
+            String location = matcher.group(2).trim();
+            if (llocInstall) {
+                location = appendQueryComponent(location, "lloc", "install");
+            }
+            if (installQuery) {
+                location = applyInstallQuery(location);
+            }
+            matcher.appendReplacement(rewritten,
+                    Matcher.quoteReplacement(matcher.group(1) + location + matcher.group(3)));
+        }
+        if (!found) {
+            Log.w(TAG, "XML AIT had no applicationLocation to append query/lloc scheme=" + scheme);
+            return xml;
+        }
+        matcher.appendTail(rewritten);
+        return rewritten.toString();
+    }
+
+    private String applyInstallQuery(String url) {
+        if (url == null || mInstallQueryPairs.isEmpty()) {
+            return url;
+        }
+        String result = url;
+        for (QueryPair pair : mInstallQueryPairs) {
+            result = appendQueryComponent(result, pair.key, pair.value);
+        }
+        return result;
+    }
+
+    private static String appendQueryComponent(String url, String key, String value) {
+        if (url == null || key == null || key.isEmpty()) {
+            return url;
+        }
+        String fragment = "";
+        int hash = url.indexOf('#');
+        if (hash >= 0) {
+            fragment = url.substring(hash);
+            url = url.substring(0, hash);
+        }
+        String sep = url.indexOf('?') >= 0 ? "&" : "?";
+        return url + sep + Uri.encode(key) + "=" + Uri.encode(value != null ? value : "") + fragment;
+    }
+
     /**
      * Atomic snapshot of a type 4.x JSON-RPC completion (method + params together).
      */
@@ -2080,12 +2438,19 @@ public class DvbIClient {
      * paramsJson may include installationtoken — do not log it.
      */
     public void handleLinkedAppJsonRpc(String method, String paramsJson) {
-        Log.i(TAG, "linked-app JSON-RPC method=" + method);
-        LinkedAppCompletion completion = new LinkedAppCompletion(method, paramsJson);
-        mLastLinkedAppCompletion = completion;
-        LinkedAppJsonRpcListener listener = mLinkedAppJsonRpcListener;
-        if (listener != null) {
-            listener.onLinkedAppJsonRpc(completion.method, completion.paramsJson);
+        Runnable deliver = () -> {
+            Log.i(TAG, "linked-app JSON-RPC method=" + method);
+            LinkedAppCompletion completion = new LinkedAppCompletion(method, paramsJson);
+            mLastLinkedAppCompletion = completion;
+            LinkedAppJsonRpcListener listener = mLinkedAppJsonRpcListener;
+            if (listener != null) {
+                listener.onLinkedAppJsonRpc(completion.method, completion.paramsJson);
+            }
+        };
+        if (Looper.getMainLooper().isCurrentThread()) {
+            deliver.run();
+        } else {
+            mMainHandler.post(deliver);
         }
     }
 
@@ -2109,6 +2474,7 @@ public class DvbIClient {
 
     public static class Callback {
         protected void onProcessXmlAit(String xmlAit, String scheme) { }
+        protected void onLaunchHtmlLinkedApp(String url, String scheme) { }
         protected void onApplicationHowRelatedHrefChanged(String href) { }
         protected void onDashStreamEvent(int listenId, String name, String status, String Id,
                                          double startTime, double duration, String data, String contentEncoding) { }
