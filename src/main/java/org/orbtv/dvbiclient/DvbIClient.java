@@ -941,6 +941,7 @@ public class DvbIClient {
         mDvbIView.addJSCallback(mJSCallback);
         mDvbIView.setDashTuneListener(tuned -> {
             if (mTvInputCallback != null) {
+                // Compositing hint (hide empty DTVKit plane), not a presenting-frames signal.
                 mTvInputCallback.onNativeDashPresenting(tuned);
             }
         });
@@ -1373,7 +1374,8 @@ public class DvbIClient {
         mDvbIView.tuneOff();
     }
 
-    /** Type 1.1 native DASH is loaded in {@link DvbIView} (not type 1.2 HTML5 in BrowserView). */
+    /** Type 1.1 native DASH is selected in {@link DvbIView} for compositing (not type 1.2 HTML5).
+     * True hides the empty DTVKit plane; it is not a decoded-frame guarantee. */
     public boolean isNativeDashTuned() {
         return mDvbIView != null && mDvbIView.isDashTuned();
     }

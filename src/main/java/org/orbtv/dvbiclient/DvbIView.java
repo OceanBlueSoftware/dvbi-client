@@ -40,11 +40,18 @@ public class DvbIView extends WebView {
     private boolean mSubsEnabled = false;
     private Boolean mPageLoaded = false;
     private Boolean mIsSuspended = false;
-    /** True while a DASH URL is tuned (thread-safe; not a WebView getter). */
+    /**
+     * True while a DASH URL is selected for compositing (thread-safe; not a WebView getter).
+     * Set on {@link #tune} early enough to hide the empty DTVKit plane; this is not a
+     * guarantee that DASH frames are presenting. Cleared on every abort path.
+     */
     private volatile boolean mDashTuned = false;
+    /** Restore compositing after {@link #setPresentationSuspended}(false) if DASH is still selected. */
+    private boolean mResumeDashCompositing = false;
     private DashTuneListener mDashTuneListener;
 
     public interface DashTuneListener {
+        /** {@code tuned} hides the empty DTVKit plane; it is not “DASH is presenting”. */
         void onDashTunedChanged(boolean tuned);
     }
 
@@ -77,6 +84,9 @@ public class DvbIView extends WebView {
             if (mSuppressVideoEvents) {
                 Log.i(TAG, "Suppressing stale video event " + eventName);
                 return;
+            }
+            if ("DVBI_PLAYBACK_ERROR".equals(eventName)) {
+                abortDashCompositing();
             }
             Log.d("JavaScriptInterface", "Video event: " + eventName + ", data: " + eventData);
             try {
@@ -159,6 +169,15 @@ public class DvbIView extends WebView {
                     }
                 }
             }
+
+            @Override
+            public void onReceivedError(WebView view, int errorCode, String description,
+                    String failingUrl) {
+                Log.e(TAG, "onReceivedError " + failingUrl + ": " + description);
+                if (DVBI_PAGE.equals(failingUrl)) {
+                    abortDashCompositing();
+                }
+            }
         });
     }
 
@@ -194,9 +213,19 @@ public class DvbIView extends WebView {
         Log.i(TAG, "Tuning to url " + url + "...");
         if (url != null && url.startsWith("http")) {
             mSuppressVideoEvents = true;
-            mDashTuned = true;
-            if (mDashTuneListener != null) {
-                mDashTuneListener.onDashTunedChanged(true);
+            // Early enough to hide the empty DTVKit plane; not a decoded-frame guarantee.
+            // Stay false while type 1.2 holds the decoders (restore on unsuspend).
+            boolean suspended;
+            synchronized (mIsSuspended) {
+                suspended = Boolean.TRUE.equals(mIsSuspended);
+            }
+            if (suspended) {
+                synchronized (this) {
+                    mResumeDashCompositing = true;
+                }
+                setDashCompositing(false);
+            } else {
+                setDashCompositing(true);
             }
             mLastUrl = url;
             mSubsEnabled = enableSubs;
@@ -230,10 +259,7 @@ public class DvbIView extends WebView {
     public void tuneOff() {
         Log.i(TAG, "Tuning off...");
         mSuppressVideoEvents = true;
-        mDashTuned = false;
-        if (mDashTuneListener != null) {
-            mDashTuneListener.onDashTunedChanged(false);
-        }
+        abortDashCompositing();
         mContext.getMainExecutor().execute(() -> {
             synchronized (mPageLoaded) {
                 mPageLoaded = false;
@@ -244,9 +270,39 @@ public class DvbIView extends WebView {
         });
     }
 
-    /** Native DASH is selected in this WebView (type 1.1). Safe from any thread. */
+    /**
+     * Native DASH is selected in this WebView (type 1.1 compositing). Safe from any thread.
+     * True is early enough to hide the empty DTVKit plane; it is not “DASH is presenting”.
+     */
     public boolean isDashTuned() {
         return mDashTuned;
+    }
+
+    /**
+     * Hide the empty DTVKit plane while a DASH URL is selected. Not a presenting-frames signal.
+     * No-op when the value is unchanged.
+     */
+    private void setDashCompositing(boolean selected) {
+        DashTuneListener listener;
+        synchronized (this) {
+            if (mDashTuned == selected) {
+                return;
+            }
+            mDashTuned = selected;
+            listener = mDashTuneListener;
+        }
+        Log.i(TAG, "native DASH compositing=" + selected);
+        if (listener != null) {
+            listener.onDashTunedChanged(selected);
+        }
+    }
+
+    /** tuneOff, failed load, or any other abort that must not leave compositing stuck true. */
+    private void abortDashCompositing() {
+        synchronized (this) {
+            mResumeDashCompositing = false;
+        }
+        setDashCompositing(false);
     }
 
     public void setVideoRectangle(int x, int y, int width, int height) {
@@ -294,6 +350,22 @@ public class DvbIView extends WebView {
         synchronized (mIsSuspended) {
             if (mIsSuspended != suspend) {
                 mIsSuspended = suspend;
+                if (suspend) {
+                    // Type 1.2 taking the AV decoders: DASH is no longer the presenting surface.
+                    synchronized (this) {
+                        mResumeDashCompositing = mDashTuned;
+                    }
+                    setDashCompositing(false);
+                } else {
+                    boolean resume;
+                    synchronized (this) {
+                        resume = mResumeDashCompositing;
+                        mResumeDashCompositing = false;
+                    }
+                    if (resume) {
+                        setDashCompositing(true);
+                    }
+                }
                 mContext.getMainExecutor().execute(() -> {
                     if (suspend) {
                         this.setVisibility(View.INVISIBLE);
