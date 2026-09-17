@@ -939,6 +939,11 @@ public class DvbIClient {
         mDbHandler = new DatabaseHandler(context);
         mDvbIView = new DvbIView(context);
         mDvbIView.addJSCallback(mJSCallback);
+        mDvbIView.setDashTuneListener(tuned -> {
+            if (mTvInputCallback != null) {
+                mTvInputCallback.onNativeDashPresenting(tuned);
+            }
+        });
         mEpgManager = new EpgManager(mDbHandler);
         mEpgManager.registerCallback(serviceUIDs -> {
             long startMs = System.currentTimeMillis();
@@ -1366,6 +1371,11 @@ public class DvbIClient {
         mSelectedTracks.clear();
         mIsUnselected.clear();
         mDvbIView.tuneOff();
+    }
+
+    /** Type 1.1 native DASH is loaded in {@link DvbIView} (not type 1.2 HTML5 in BrowserView). */
+    public boolean isNativeDashTuned() {
+        return mDvbIView != null && mDvbIView.isDashTuned();
     }
 
     public void setPresentationSuspended(boolean suspend) {

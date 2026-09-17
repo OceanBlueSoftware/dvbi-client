@@ -41,6 +41,7 @@ public class ITvInputCallback {
 
     public boolean tuneBroadcast(String uri) { return false; }
     public void tuneOffBroadcast() { }
+    public void onNativeDashPresenting(boolean presenting) { }
     public void notifyVideoAvailable() { }
     public void notifyVideoUnavailable(int reason) { }
     public void updateEventPeriods() { }

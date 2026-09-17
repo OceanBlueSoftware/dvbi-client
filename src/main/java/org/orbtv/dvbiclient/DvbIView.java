@@ -13,12 +13,13 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
- 
+
 package org.orbtv.dvbiclient;
 
 import android.content.Context;
 import android.graphics.Color;
 import android.os.Build;
+import android.os.Looper;
 import android.util.Log;
 import android.view.View;
 import android.webkit.JavascriptInterface;
@@ -39,6 +40,17 @@ public class DvbIView extends WebView {
     private boolean mSubsEnabled = false;
     private Boolean mPageLoaded = false;
     private Boolean mIsSuspended = false;
+    /** True while a DASH URL is tuned (thread-safe; not a WebView getter). */
+    private volatile boolean mDashTuned = false;
+    private DashTuneListener mDashTuneListener;
+
+    public interface DashTuneListener {
+        void onDashTunedChanged(boolean tuned);
+    }
+
+    public void setDashTuneListener(DashTuneListener listener) {
+        mDashTuneListener = listener;
+    }
     /** Drop dash.js events from a previous MPD across instance switch (ERRATA0900). */
     private volatile boolean mSuppressVideoEvents = false;
     private int mViewWidth = 0; // Await onLayoutChange to calculate View width
@@ -103,6 +115,7 @@ public class DvbIView extends WebView {
         setLongClickable(false);
 
         setBackgroundColor(Color.TRANSPARENT);
+        setLayerType(View.LAYER_TYPE_NONE, null);
         getSettings().setJavaScriptEnabled(true);
         getSettings().setMediaPlaybackRequiresUserGesture(false);
         getSettings().setLoadWithOverviewMode(true);
@@ -181,6 +194,10 @@ public class DvbIView extends WebView {
         Log.i(TAG, "Tuning to url " + url + "...");
         if (url != null && url.startsWith("http")) {
             mSuppressVideoEvents = true;
+            mDashTuned = true;
+            if (mDashTuneListener != null) {
+                mDashTuneListener.onDashTunedChanged(true);
+            }
             mLastUrl = url;
             mSubsEnabled = enableSubs;
             mContext.getMainExecutor().execute(() -> {
@@ -189,6 +206,9 @@ public class DvbIView extends WebView {
                     // skips onResume (mPageLoaded=false). A paused WebView will not load
                     // dvbipage.html or fetch the MPD (ERRATA0900 RF→DASH).
                     this.onResume();
+                    // Opaque until the HTML5 overlay has frames; TRANSPARENT lets the empty
+                    // DTVKit plane (emulator green) show through the video hole.
+                    this.setBackgroundColor(Color.BLACK);
                     if (!mIsSuspended) {
                         this.setVisibility(View.VISIBLE);
                         this.clearFocus();
@@ -210,13 +230,23 @@ public class DvbIView extends WebView {
     public void tuneOff() {
         Log.i(TAG, "Tuning off...");
         mSuppressVideoEvents = true;
+        mDashTuned = false;
+        if (mDashTuneListener != null) {
+            mDashTuneListener.onDashTunedChanged(false);
+        }
         mContext.getMainExecutor().execute(() -> {
             synchronized (mPageLoaded) {
                 mPageLoaded = false;
+                this.setBackgroundColor(Color.TRANSPARENT);
                 this.setVisibility(View.INVISIBLE);
                 this.loadUrl("about:blank");
             }
         });
+    }
+
+    /** Native DASH is selected in this WebView (type 1.1). Safe from any thread. */
+    public boolean isDashTuned() {
+        return mDashTuned;
     }
 
     public void setVideoRectangle(int x, int y, int width, int height) {
