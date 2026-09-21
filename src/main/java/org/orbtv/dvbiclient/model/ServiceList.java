@@ -195,6 +195,10 @@ public class ServiceList {
             mInstance.mContentGuideSources = value;
             return this;
         }
+        public ServiceList.Builder setRelatedMaterials(List<RelatedMaterial> value) {
+            mInstance.mRelatedMaterials = value != null ? value : new ArrayList<RelatedMaterial>();
+            return this;
+        }
         public ServiceList build() {
             ServiceList instance = new ServiceList();
             instance.mUID = mInstance.mUID;
