@@ -40,6 +40,7 @@ public class DatabaseHandler extends SQLiteOpenHelper {
     private static final String DB_NAME = "dvbi_db";
     private static final String FOREIGN_KEY_PREFIX_SERVICE = "service_";
     private static final String FOREIGN_KEY_PREFIX_INSTANCE = "instance_";
+    private static final String FOREIGN_KEY_PREFIX_LIST = "list_";
     private static final String COLUMN_ID = "id";
     private static final String COLUMN_FOREIGN_KEY = "foreign_key";
     private static final String COLUMN_INDEX = "array_index";
@@ -174,6 +175,7 @@ public class DatabaseHandler extends SQLiteOpenHelper {
                     ret.add(listBuilder
                             .setUID(cursor.getString(0))
                             .setServices(getServices(db, cursor.getString(0)))
+                            .setRelatedMaterials(getRelatedMaterials(db, FOREIGN_KEY_PREFIX_LIST + cursor.getString(0)))
                             .build());
                 }
             }
@@ -257,6 +259,8 @@ public class DatabaseHandler extends SQLiteOpenHelper {
         else {
             //Log.d(TAG, "Updating service list " + serviceList.getUID());
         }
+        updateRelatedMaterials(db, FOREIGN_KEY_PREFIX_LIST + serviceList.getUID(),
+                serviceList.getRelatedMaterials());
 
         for (Service service : serviceList.getServices()) {
             String uid = service.getUniqueIdentifier();
@@ -285,6 +289,69 @@ public class DatabaseHandler extends SQLiteOpenHelper {
         }
         Log.i(TAG, "Deleting content guides with CGSIDs not in " + cgsids);
         db.delete(CONTENT_GUIDES_TABLE, ContentGuide.DB_COLUMN_CGSID + " NOT IN (" + cgsids + ")", null);
+    }
+
+    public synchronized void deleteServiceList(String listUid) {
+        if (listUid == null || listUid.isEmpty()) {
+            return;
+        }
+        SQLiteDatabase db = getWritableDatabase();
+        db.beginTransaction();
+        try {
+            List<String> serviceUids = new ArrayList<>();
+            Cursor services = db.query(SERVICES_TABLE,
+                    new String[]{Service.DB_COLUMN_UNIQUE_IDENTIFIER},
+                    COLUMN_FOREIGN_KEY + "=?", new String[]{listUid},
+                    null, null, null);
+            try {
+                while (services != null && services.moveToNext()) {
+                    serviceUids.add(services.getString(0));
+                }
+            } finally {
+                if (services != null) {
+                    services.close();
+                }
+            }
+            for (String serviceUid : serviceUids) {
+                deleteServiceChildren(db, serviceUid);
+            }
+            db.delete(SERVICES_TABLE, COLUMN_FOREIGN_KEY + "=?", new String[]{listUid});
+            db.delete(RELATED_MATERIALS_TABLE, COLUMN_FOREIGN_KEY + "=?",
+                    new String[]{FOREIGN_KEY_PREFIX_LIST + listUid});
+            db.delete(SERVICE_LISTS_TABLE, ServiceList.DB_COLUMN_UID + "=?", new String[]{listUid});
+            db.setTransactionSuccessful();
+            Log.i(TAG, "Deleted service list " + listUid + " and " + serviceUids.size() + " services");
+        } finally {
+            db.endTransaction();
+        }
+    }
+
+    private void deleteServiceChildren(SQLiteDatabase db, String serviceUid) {
+        Cursor instances = db.query(SERVICE_INSTANCES_TABLE, new String[]{COLUMN_INDEX},
+                COLUMN_FOREIGN_KEY + "=?", new String[]{serviceUid}, null, null, null);
+        try {
+            while (instances != null && instances.moveToNext()) {
+                String instanceKey = FOREIGN_KEY_PREFIX_INSTANCE + serviceUid + "_" + instances.getInt(0);
+                db.delete(RELATED_MATERIALS_TABLE, COLUMN_FOREIGN_KEY + "=?", new String[]{instanceKey});
+                db.delete(AVAILABILITY_PERIOD_TABLE, COLUMN_FOREIGN_KEY + "=?", new String[]{instanceKey});
+                db.delete(AVAILABILITY_PERIOD_INTERVALS_TABLE,
+                        COLUMN_FOREIGN_KEY + " LIKE ? ESCAPE '!'",
+                        new String[]{sqlLikePrefix(instanceKey + "_")});
+            }
+        } finally {
+            if (instances != null) {
+                instances.close();
+            }
+        }
+        db.delete(SERVICE_INSTANCES_TABLE, COLUMN_FOREIGN_KEY + "=?", new String[]{serviceUid});
+        db.delete(SERVICE_NAMES_TABLE, COLUMN_FOREIGN_KEY + "=?", new String[]{serviceUid});
+        db.delete(PROGRAMMES_TABLE, COLUMN_FOREIGN_KEY + "=?", new String[]{serviceUid});
+        db.delete(RELATED_MATERIALS_TABLE, COLUMN_FOREIGN_KEY + "=?",
+                new String[]{FOREIGN_KEY_PREFIX_SERVICE + serviceUid});
+    }
+
+    private static String sqlLikePrefix(String literal) {
+        return literal.replace("!", "!!").replace("%", "!%").replace("_", "!_") + "%";
     }
 
     public synchronized void updateProgrammesForService(String serviceUID, List<Programme> programmes) {
