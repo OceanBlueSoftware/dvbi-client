@@ -3073,6 +3073,7 @@ public class DvbIClient {
         }
         SharedPreferences prefs = mDvbIView.getContext().getSharedPreferences("DvbIClient", Context.MODE_PRIVATE);
         SharedPreferences.Editor editor = prefs.edit()
+                .putString(PREF_LA_ACTIVE_UID, mActiveListUid)
                 .putString(PREF_LA41_QUERY_PREFIX + mActiveListUid, queryPairsToJson());
         persistLinkedAppCredentials(editor, mActiveListUid);
         editor.apply();
