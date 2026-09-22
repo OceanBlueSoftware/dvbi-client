@@ -58,6 +58,7 @@ import java.util.Iterator;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Set;
 import java.util.Timer;
 import java.util.concurrent.Executor;
@@ -172,7 +173,9 @@ public class DvbIClient {
     private String mPendingServiceListXml;
     private final List<QueryPair> mInstallQueryPairs = new ArrayList<>();
     private String mPendingRenewUrl;
-    private String mInstallationToken;
+    private String mPendingInstallationToken;
+    private String mActiveRenewUrl;
+    private String mActiveInstallationToken;
     private String mActiveListUid;
     private String mType42Uri;
     private String mType42ContentType;
@@ -2026,6 +2029,7 @@ public class DvbIClient {
                         + mPendingServiceList.getUID() + " — skipping install gate");
                 restoreType41QueryPairs(mPendingServiceList);
                 mActiveListUid = mPendingServiceList.getUID();
+                restoreActiveCredentials(mActiveListUid);
                 captureType4xLocators(mPendingServiceList);
                 persistActiveCredentials();
                 commitPendingServiceList();
@@ -2304,6 +2308,7 @@ public class DvbIClient {
         if (html || isHtmlLinkedAppUrl(url, html)) {
             String launchUrl = appendQueryComponent(url, "lloc", lloc);
             launchUrl = applyInstallQuery(launchUrl);
+            launchUrl = applyInstallationToken(launchUrl, scheme);
             for (Callback cb : mCallbacks) {
                 cb.onLaunchHtmlLinkedApp(launchUrl, scheme);
             }
@@ -2403,15 +2408,14 @@ public class DvbIClient {
         mPendingServiceList = null;
         mPendingServiceListUri = null;
         mPendingServiceListXml = null;
-        mInstallQueryPairs.clear();
         mPendingRenewUrl = null;
-        mInstallationToken = null;
+        mPendingInstallationToken = null;
     }
 
     private void applyInstallSuccessParams(String paramsJson) {
         mInstallQueryPairs.clear();
         mPendingRenewUrl = null;
-        mInstallationToken = null;
+        mPendingInstallationToken = null;
         try {
             JSONObject params = new JSONObject(paramsJson != null ? paramsJson : "{}");
             parseInstallQuery(params);
@@ -2421,12 +2425,28 @@ public class DvbIClient {
                     mPendingRenewUrl = emptyToNull(response.optString("renewurl", null));
                 }
                 if (response.has("installationtoken")) {
-                    mInstallationToken = emptyToNull(response.optString("installationtoken", null));
+                    mPendingInstallationToken = emptyToNull(response.optString("installationtoken", null));
                 }
             }
         } catch (JSONException e) {
             Log.w(TAG, "Type 4.1 success params were not JSON");
         }
+    }
+
+    private void promotePendingCredentialsToActive() {
+        mActiveRenewUrl = mPendingRenewUrl;
+        mActiveInstallationToken = mPendingInstallationToken;
+    }
+
+    private void restoreActiveCredentials(String uid) {
+        if (uid == null) {
+            return;
+        }
+        SharedPreferences prefs = mDvbIView.getContext().getSharedPreferences("DvbIClient", Context.MODE_PRIVATE);
+        mActiveRenewUrl = prefs.getString(PREF_LA_RENEWURL_PREFIX + uid, null);
+        mActiveInstallationToken = prefs.getString(PREF_LA_TOKEN_PREFIX + uid, null);
+        mRenewDeadlineMs = prefs.getLong(PREF_LA_DEADLINE_PREFIX + uid, -1L);
+        mLastRenewFailed = prefs.getBoolean(PREF_LA_RENEW_FAILED_PREFIX + uid, false);
     }
 
     private void parseInstallQuery(JSONObject params) {
@@ -2487,10 +2507,11 @@ public class DvbIClient {
                 .putStringSet(PREF_LA_WITHDRAWN_UIDS, withdrawn)
                 .putString(PREF_LA41_QUERY_PREFIX + list.getUID(), queryPairsToJson())
                 .putString(PREF_LA_ACTIVE_UID, list.getUID());
+        promotePendingCredentialsToActive();
         persistLinkedAppCredentials(editor, list.getUID());
         editor.apply();
         Log.i(TAG, "Persisted type 4.1 install completion for list UID " + list.getUID()
-                + " renewurl=" + (mPendingRenewUrl != null));
+                + " renewurl=" + (mActiveRenewUrl != null));
     }
 
     private void captureType4xLocators(ServiceList list) {
@@ -2503,8 +2524,8 @@ public class DvbIClient {
     }
 
     private void persistLinkedAppCredentials(SharedPreferences.Editor editor, String uid) {
-        putPrefOrRemove(editor, PREF_LA_RENEWURL_PREFIX + uid, mPendingRenewUrl);
-        putPrefOrRemove(editor, PREF_LA_TOKEN_PREFIX + uid, mInstallationToken);
+        putPrefOrRemove(editor, PREF_LA_RENEWURL_PREFIX + uid, mActiveRenewUrl);
+        putPrefOrRemove(editor, PREF_LA_TOKEN_PREFIX + uid, mActiveInstallationToken);
         putPrefOrRemove(editor, PREF_LA42_URI_PREFIX + uid, mType42Uri);
         putPrefOrRemove(editor, PREF_LA42_CTYPE_PREFIX + uid, mType42ContentType);
         putPrefOrRemove(editor, PREF_LA43_URI_PREFIX + uid, mType43Uri);
@@ -2596,6 +2617,7 @@ public class DvbIClient {
             if (installQuery) {
                 location = applyInstallQuery(location);
             }
+            location = applyInstallationToken(location, scheme);
             matcher.appendReplacement(rewritten,
                     Matcher.quoteReplacement(matcher.group(1) + location + matcher.group(3)));
         }
@@ -2629,6 +2651,20 @@ public class DvbIClient {
             result = appendQueryComponent(result, pair.key, pair.value);
         }
         return result;
+    }
+
+    /** §5.2.3.6.4: pass installationtoken to type 4.2 and 4.3 on launch. */
+    private String applyInstallationToken(String url, String scheme) {
+        if (url == null) {
+            return null;
+        }
+        if (!LINKED_APP_SCHEME_4_2.equals(scheme) && !LINKED_APP_SCHEME_4_3.equals(scheme)) {
+            return url;
+        }
+        if (mActiveInstallationToken == null || mActiveInstallationToken.isEmpty()) {
+            return url;
+        }
+        return appendQueryComponent(url, "installationtoken", mActiveInstallationToken);
     }
 
     private static String appendQueryComponent(String url, String key, String value) {
@@ -2695,8 +2731,7 @@ public class DvbIClient {
             return;
         }
         restoreType41QueryPairs(new ServiceList.Builder().setUID(mActiveListUid).build());
-        mPendingRenewUrl = prefs.getString(PREF_LA_RENEWURL_PREFIX + mActiveListUid, null);
-        mInstallationToken = prefs.getString(PREF_LA_TOKEN_PREFIX + mActiveListUid, null);
+        restoreActiveCredentials(mActiveListUid);
         mType42Uri = prefs.getString(PREF_LA42_URI_PREFIX + mActiveListUid, null);
         mType42ContentType = prefs.getString(PREF_LA42_CTYPE_PREFIX + mActiveListUid, null);
         mType43Uri = prefs.getString(PREF_LA43_URI_PREFIX + mActiveListUid, null);
@@ -2722,8 +2757,6 @@ public class DvbIClient {
                 }
             }
         }
-        mRenewDeadlineMs = prefs.getLong(PREF_LA_DEADLINE_PREFIX + mActiveListUid, -1L);
-        mLastRenewFailed = prefs.getBoolean(PREF_LA_RENEW_FAILED_PREFIX + mActiveListUid, false);
         if (isConsentWithdrawn(mActiveListUid)) {
             return;
         }
@@ -2734,13 +2767,31 @@ public class DvbIClient {
         if (mRenewDeadlineMs > 0) {
             scheduleType43Launch(mRenewDeadlineMs);
         }
-        if (mPendingRenewUrl != null) {
+        if (mActiveRenewUrl != null) {
             startRenewUrlPolling(0);
         }
     }
 
+    /**
+     * Host reports that a type 4.2/4.3 application is no longer presenting
+     * (destroyed, replaced, or Setup torn down) without a JSON-RPC completion.
+     */
+    public void notifyType4xAppEnded(String scheme) {
+        if (LINKED_APP_SCHEME_4_2.equals(scheme)) {
+            mType42AppRunning = false;
+            return;
+        }
+        if (!LINKED_APP_SCHEME_4_3.equals(scheme) || !mType43AppRunning) {
+            return;
+        }
+        mType43AppRunning = false;
+        if (mRenewDeadlineMs > 0 && System.currentTimeMillis() >= mRenewDeadlineMs) {
+            withdrawConsent();
+        }
+    }
+
     private void startRenewUrlPolling(long delayMs) {
-        if (mPendingRenewUrl == null || mType43AppRunning || isConsentWithdrawn(mActiveListUid)) {
+        if (mActiveRenewUrl == null || isConsentWithdrawn(mActiveListUid)) {
             return;
         }
         mMainHandler.removeCallbacks(mRenewPollRunnable);
@@ -2749,16 +2800,20 @@ public class DvbIClient {
 
     private void stopRenewUrlPolling() {
         mMainHandler.removeCallbacks(mRenewPollRunnable);
+    }
+
+    private void stopAllRenewTimers() {
+        stopRenewUrlPolling();
         mMainHandler.removeCallbacks(mLaunchType43Runnable);
         mMainHandler.removeCallbacks(mRenewDeadlineExpired);
     }
 
     private void runRenewUrlPoll() {
-        if (mPendingRenewUrl == null || mType43AppRunning || isConsentWithdrawn(mActiveListUid)) {
+        if (mActiveRenewUrl == null || isConsentWithdrawn(mActiveListUid)) {
             return;
         }
-        final String url = mPendingRenewUrl;
-        final String token = mInstallationToken;
+        final String url = mActiveRenewUrl;
+        final String token = mActiveInstallationToken;
         mIoExecutor.execute(() -> {
             RenewPollResult result = fetchRenewUrl(url, token);
             mMainHandler.post(() -> handleRenewPollResult(result));
@@ -2771,17 +2826,22 @@ public class DvbIClient {
         final String body;
         final String contentType;
         final String cacheControl;
-        RenewPollResult(int code, boolean connectFailed, String body, String contentType, String cacheControl) {
+        final String url;
+        final String token;
+        RenewPollResult(int code, boolean connectFailed, String body, String contentType,
+                String cacheControl, String url, String token) {
             this.code = code;
             this.connectFailed = connectFailed;
             this.body = body;
             this.contentType = contentType;
             this.cacheControl = cacheControl;
+            this.url = url;
+            this.token = token;
         }
     }
 
     /**
-     * TS 103 770 §5.2.3.6.2. Token is sent as Authorization when present; never log it.
+     * TS 103 770 §5.2.3.6.2. Never log the installation token.
      */
     private static RenewPollResult fetchRenewUrl(String renewUrl, String token) {
         HttpURLConnection connection = null;
@@ -2792,9 +2852,6 @@ public class DvbIClient {
             connection.setConnectTimeout(10000);
             connection.setReadTimeout(10000);
             connection.setInstanceFollowRedirects(true);
-            if (token != null && !token.isEmpty()) {
-                connection.setRequestProperty("Authorization", "Bearer " + token);
-            }
             int code = connection.getResponseCode();
             String contentType = connection.getContentType();
             String cacheControl = connection.getHeaderField("Cache-Control");
@@ -2813,10 +2870,10 @@ public class DvbIClient {
                 reader.close();
                 body = content.toString();
             }
-            return new RenewPollResult(code, false, body, contentType, cacheControl);
+            return new RenewPollResult(code, false, body, contentType, cacheControl, renewUrl, token);
         } catch (IOException e) {
             Log.w(TAG, "renewurl poll failed before HTTP response");
-            return new RenewPollResult(-1, true, null, null, null);
+            return new RenewPollResult(-1, true, null, null, null, renewUrl, token);
         } finally {
             if (connection != null) {
                 connection.disconnect();
@@ -2825,7 +2882,12 @@ public class DvbIClient {
     }
 
     private void handleRenewPollResult(RenewPollResult result) {
-        if (mPendingRenewUrl == null || mType43AppRunning || isConsentWithdrawn(mActiveListUid)) {
+        if (mActiveRenewUrl == null || isConsentWithdrawn(mActiveListUid)) {
+            return;
+        }
+        if (!Objects.equals(result.url, mActiveRenewUrl)
+                || !Objects.equals(result.token, mActiveInstallationToken)) {
+            Log.i(TAG, "Ignoring stale renewurl poll after credential replacement");
             return;
         }
         if (result.connectFailed || result.code == HttpURLConnection.HTTP_NOT_FOUND) {
@@ -2927,8 +2989,7 @@ public class DvbIClient {
         mLastRenewFailed = false;
         persistActiveCredentials();
         Log.i(TAG, "renewurl signalled time " + Instant.ofEpochMilli(whenMs));
-        // Polling continues until the 4.3 app exits (§5.2.3.6.2). Launch is allowed
-        // before the signalled time or at the first opportunity after it.
+        // Polling of that renewurl continues until the 4.3 app exits (§5.2.3.6.2).
         scheduleType43Launch(whenMs);
     }
 
@@ -2946,12 +3007,12 @@ public class DvbIClient {
     }
 
     private void onRenewDeadlineExpired() {
-        if (mType43AppRunning) {
+        if (isConsentWithdrawn(mActiveListUid)) {
             return;
         }
-        if (mLastRenewFailed) {
-            withdrawConsent();
-        }
+        // No renew_success by the signalled time — including a 4.3 app that
+        // exited without JSON-RPC or is still running.
+        withdrawConsent();
     }
 
     private void launchType43App() {
@@ -2963,7 +3024,6 @@ public class DvbIClient {
             return;
         }
         mType43AppRunning = true;
-        stopRenewUrlPolling();
         Log.i(TAG, "Launching type 4.3 renewal app");
         boolean html = isHtmlContentType(mType43ContentType) || isHtmlLinkedAppUrl(mType43Uri, false);
         launchLinkedApp(mType43Uri, html, LINKED_APP_SCHEME_4_3, "renewal-of-agreement", false);
@@ -2995,7 +3055,9 @@ public class DvbIClient {
             mType43AppRunning = false;
             mLastRenewFailed = false;
             mRenewDeadlineMs = -1L;
+            mMainHandler.removeCallbacks(mRenewDeadlineExpired);
             applyInstallSuccessParams(paramsJson);
+            promotePendingCredentialsToActive();
             persistActiveCredentials();
             Log.i(TAG, "Type 4.3 renew_success — polling replacement renewurl");
             startRenewUrlPolling(0);
@@ -3022,11 +3084,13 @@ public class DvbIClient {
             return;
         }
         Log.i(TAG, "Consent withdrawn for list UID " + uid);
-        stopRenewUrlPolling();
+        stopAllRenewTimers();
         mType42AppRunning = false;
         mType43AppRunning = false;
         mPendingRenewUrl = null;
-        mInstallationToken = null;
+        mPendingInstallationToken = null;
+        mActiveRenewUrl = null;
+        mActiveInstallationToken = null;
         mRenewDeadlineMs = -1L;
         SharedPreferences prefs = mDvbIView.getContext().getSharedPreferences("DvbIClient", Context.MODE_PRIVATE);
         Set<String> withdrawn = new HashSet<>(prefs.getStringSet(PREF_LA_WITHDRAWN_UIDS, Collections.emptySet()));
