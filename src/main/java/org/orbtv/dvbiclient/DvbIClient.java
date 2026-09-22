@@ -2139,8 +2139,7 @@ public class DvbIClient {
                     mType42AppRunning = false;
                 }
                 if (LINKED_APP_SCHEME_4_3.equals(result.scheme)) {
-                    mType43AppRunning = false;
-                    startRenewUrlPolling(0);
+                    onType43EndedWithoutCompletion();
                 }
                 return;
             }
@@ -2436,6 +2435,31 @@ public class DvbIClient {
     private void promotePendingCredentialsToActive() {
         mActiveRenewUrl = mPendingRenewUrl;
         mActiveInstallationToken = mPendingInstallationToken;
+    }
+
+    /**
+     * §5.2.3.6.2: 4.3 may include a replacement renewurl / token. Omitted fields
+     * and a missing query keep the live 4.1 values.
+     */
+    private void applyRenewSuccessParams(String paramsJson) {
+        try {
+            JSONObject params = new JSONObject(paramsJson != null ? paramsJson : "{}");
+            if (params.has("query") && !params.isNull("query")) {
+                mInstallQueryPairs.clear();
+                parseInstallQuery(params);
+            }
+            JSONObject response = params.optJSONObject("application_response");
+            if (response != null) {
+                if (response.has("renewurl")) {
+                    mActiveRenewUrl = emptyToNull(response.optString("renewurl", null));
+                }
+                if (response.has("installationtoken")) {
+                    mActiveInstallationToken = emptyToNull(response.optString("installationtoken", null));
+                }
+            }
+        } catch (JSONException e) {
+            Log.w(TAG, "Type 4.3 success params were not JSON");
+        }
     }
 
     private void restoreActiveCredentials(String uid) {
@@ -2781,13 +2805,22 @@ public class DvbIClient {
             mType42AppRunning = false;
             return;
         }
-        if (!LINKED_APP_SCHEME_4_3.equals(scheme) || !mType43AppRunning) {
+        if (LINKED_APP_SCHEME_4_3.equals(scheme)) {
+            onType43EndedWithoutCompletion();
+        }
+    }
+
+    /** 4.3 left without renew_success / renew_failure (host tear-down or AIT fetch fail). */
+    private void onType43EndedWithoutCompletion() {
+        if (!mType43AppRunning) {
             return;
         }
         mType43AppRunning = false;
         if (mRenewDeadlineMs > 0 && System.currentTimeMillis() >= mRenewDeadlineMs) {
             withdrawConsent();
+            return;
         }
+        startRenewUrlPolling(0);
     }
 
     private void startRenewUrlPolling(long delayMs) {
@@ -2996,37 +3029,42 @@ public class DvbIClient {
     private void scheduleType43Launch(long whenMs) {
         mMainHandler.removeCallbacks(mLaunchType43Runnable);
         mMainHandler.removeCallbacks(mRenewDeadlineExpired);
-        long now = System.currentTimeMillis();
-        if (whenMs <= now) {
-            launchType43App();
+        if (!launchType43App()) {
+            withdrawConsent();
             return;
         }
-        // Launch before the signalled time so 0130/0140/0150 do not depend on standby.
-        launchType43App();
-        mMainHandler.postDelayed(mRenewDeadlineExpired, Math.max(0, whenMs - now));
+        long delayMs = Math.max(0, whenMs - System.currentTimeMillis());
+        mMainHandler.postDelayed(mRenewDeadlineExpired, delayMs);
     }
 
     private void onRenewDeadlineExpired() {
         if (isConsentWithdrawn(mActiveListUid)) {
             return;
         }
-        // No renew_success by the signalled time — including a 4.3 app that
-        // exited without JSON-RPC or is still running.
+        if (mType43AppRunning) {
+            // Still presenting; wait for JSON-RPC or notifyType4xAppEnded.
+            return;
+        }
         withdrawConsent();
     }
 
-    private void launchType43App() {
-        if (mType43AppRunning || isConsentWithdrawn(mActiveListUid)) {
-            return;
+    /** @return true if a 4.3 app is presenting or was just launched */
+    private boolean launchType43App() {
+        if (isConsentWithdrawn(mActiveListUid)) {
+            return false;
+        }
+        if (mType43AppRunning) {
+            return true;
         }
         if (mType43Uri == null || mType43Uri.isEmpty()) {
             Log.i(TAG, "renewurl time received but no type 4.3 app is signalled");
-            return;
+            return false;
         }
         mType43AppRunning = true;
         Log.i(TAG, "Launching type 4.3 renewal app");
         boolean html = isHtmlContentType(mType43ContentType) || isHtmlLinkedAppUrl(mType43Uri, false);
         launchLinkedApp(mType43Uri, html, LINKED_APP_SCHEME_4_3, "renewal-of-agreement", false);
+        return true;
     }
 
     private void persistActiveCredentials() {
@@ -3056,8 +3094,7 @@ public class DvbIClient {
             mLastRenewFailed = false;
             mRenewDeadlineMs = -1L;
             mMainHandler.removeCallbacks(mRenewDeadlineExpired);
-            applyInstallSuccessParams(paramsJson);
-            promotePendingCredentialsToActive();
+            applyRenewSuccessParams(paramsJson);
             persistActiveCredentials();
             Log.i(TAG, "Type 4.3 renew_success — polling replacement renewurl");
             startRenewUrlPolling(0);
