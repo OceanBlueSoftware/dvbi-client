@@ -412,7 +412,11 @@
                     _events[e] = 0;
                     _player.off(e, _streamEventHandler);
                 }
+                // Presence checks queued against the previous MPD must not be
+                // flushed when this source's manifestLoaded runs.
                 _manifestEventStreamsReady = false;
+                _pendingEventPresenceChecks = [];
+                _eventStreams = {};
                 _player.attachSource(url);
                 _player.play();
                 _startPlaybackWatchdog();
