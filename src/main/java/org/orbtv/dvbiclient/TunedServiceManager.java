@@ -362,6 +362,13 @@ public class TunedServiceManager {
         return false;
     }
 
+    /** True if the instance is inside its Availability Period (or has none). */
+    public boolean isInstanceInAvailabilityWindow(ServiceInstance instance) {
+        synchronized (mLock) {
+            return isInstanceAvailable(instance);
+        }
+    }
+
     private boolean isInstanceAvailable(ServiceInstance instance) {
         List<AvailabilityPeriod> periods = instance.getAvailabilityPeriods();
         if (periods == null || periods.isEmpty()) {
