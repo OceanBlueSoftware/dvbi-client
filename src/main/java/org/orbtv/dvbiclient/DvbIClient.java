@@ -2238,6 +2238,7 @@ public class DvbIClient {
         Log.d(TAG, "finalizeSearch: Service list discovery completed, triggering callbacks");
         mLastDiscoveryTask = null; // Reset so new searches can be started
         mCurrentServiceListUrl = null; // Clear tracked URL
+        clearType13SessionState();
         for (DvbCallback handler : mDvbCallbacks) {
             handler.onDvbtStatusChanged(100);
         }
@@ -3466,6 +3467,38 @@ public class DvbIClient {
         } catch (DateTimeParseException e) {
             Log.w(TAG, "Type 1.3 persistent date was not ISO-8601: " + value);
             return false;
+        }
+    }
+
+    /**
+     * Drop leftover type 1.3 persist / retry / query after a list install.
+     * Sequential official tests share one DUT: APPS0320 stores persistent=forever,
+     * APPS0410/0440 leave a retry hold, and the next test then skips 1.3.
+     */
+    private void clearType13SessionState() {
+        mPreplayState = PREPLAY_NONE;
+        mPreplayServiceUid = null;
+        mPreplayAitUrl = null;
+        mPreplayQueryPairs.clear();
+        if (mDvbIView == null || mDvbIView.getContext() == null) {
+            return;
+        }
+        SharedPreferences prefs = mDvbIView.getContext()
+                .getSharedPreferences("DvbIClient", Context.MODE_PRIVATE);
+        SharedPreferences.Editor editor = prefs.edit();
+        boolean removed = false;
+        for (String key : prefs.getAll().keySet()) {
+            if (key != null && (key.startsWith(PREF_LA13_PERSIST_PREFIX)
+                    || key.startsWith(PREF_LA13_QUERY_PREFIX)
+                    || key.startsWith(PREF_LA13_RETRY_UNTIL_PREFIX)
+                    || key.startsWith(PREF_LA13_RETRY_SCOPE_PREFIX))) {
+                editor.remove(key);
+                removed = true;
+            }
+        }
+        if (removed) {
+            editor.apply();
+            Log.i(TAG, "Cleared leftover type 1.3 persist/retry/query after service-list update");
         }
     }
 
