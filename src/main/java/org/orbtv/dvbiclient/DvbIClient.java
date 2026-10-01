@@ -189,6 +189,8 @@ public class DvbIClient {
     private String mPreplayServiceUid;
     private String mPreplayAitUrl;
     private boolean mPreplaySignalledOnInstance;
+    private final Runnable mType13RetryRunnable = this::onType13RetryElapsed;
+    private String mType13RetryUid;
     private String mPendingRenewUrl;
     private String mPendingInstallationToken;
     private String mActiveRenewUrl;
@@ -636,8 +638,10 @@ public class DvbIClient {
                 return false;
             }
             if (mPreplayState == PREPLAY_FAILED) {
-                Log.i(TAG, "Type 1.3 pre-play failed; media not started");
-                return false;
+                // Retry prefs already expired (isType13RetryHeld returned false).
+                // Keep FAILED only while the hold is active.
+                Log.i(TAG, "Type 1.3 retry hold expired; allowing relaunch");
+                mPreplayState = PREPLAY_NONE;
             }
             int contentAge = resolveContentAge(service, instance);
             Log.i(TAG, "Type 1.3 parental check: contentAge=" + contentAge
@@ -1427,6 +1431,14 @@ public class DvbIClient {
                 // If an O.5.4 pin is holding a lower-priority instance (DASH), unlock
                 // and select highest-priority available (RF) (ERRATA0900 step 9).
                 if (isCurrentHighestPriorityInstance(current, currentInst)) {
+                    if (mPreplayState == PREPLAY_FAILED
+                            && !isType13RetryHeld(current, currentInst, mPreplayAitUrl)) {
+                        Log.i(TAG, "tune: already on " + uid
+                                + "; type 1.3 retry elapsed, relaunching");
+                        mPreplayState = PREPLAY_NONE;
+                        mServiceManager.reselectAfterType13RetryHold();
+                        return true;
+                    }
                     Log.i(TAG, "tune: already on " + uid + "; keep parental state");
                     rePromptParentalIfBlocked();
                     return true;
@@ -1441,8 +1453,10 @@ public class DvbIClient {
             }
         }
         mTuneGeneration++;
+        cancelType13RetryRelaunch();
         mPreplayState = PREPLAY_NONE;
         mPreplayServiceUid = null;
+        mPreplayAitUrl = null;
         mPreplayQueryPairs.clear();
         boolean blocked = mBlocked;
         mBlocked = false;
@@ -1565,8 +1579,10 @@ public class DvbIClient {
         Log.i(TAG, "tuneOff: drop DVB-I selection (gen " + mTuneGeneration + " -> "
             + (mTuneGeneration + 1) + ")");
         mTuneGeneration++;
+        cancelType13RetryRelaunch();
         mPreplayState = PREPLAY_NONE;
         mPreplayServiceUid = null;
+        mPreplayAitUrl = null;
         mPreplayQueryPairs.clear();
         mBlocked = false;
         mOverrideRequestPending = false;
@@ -3386,6 +3402,7 @@ public class DvbIClient {
                 Log.w(TAG, "Type 1.3 preplay_success params were not JSON");
             }
             mPreplayState = PREPLAY_SUCCEEDED;
+            cancelType13RetryRelaunch();
             Log.i(TAG, "Type 1.3 preplay_success — chaining to 1.1/1.2 / media");
             ServiceInstance instance = mServiceManager.getTunedInstance();
             if (instance != null) {
@@ -3476,6 +3493,7 @@ public class DvbIClient {
      * APPS0410/0440 leave a retry hold, and the next test then skips 1.3.
      */
     private void clearType13SessionState() {
+        cancelType13RetryRelaunch();
         mPreplayState = PREPLAY_NONE;
         mPreplayServiceUid = null;
         mPreplayAitUrl = null;
@@ -3613,6 +3631,7 @@ public class DvbIClient {
     }
 
     private void applyType13RetryHold(Service service, ServiceInstance instance, String aitUrl) {
+        scheduleType13RetryRelaunch(service, instance, aitUrl);
         boolean instanceScope = instanceHasLinkedApp(instance, LINKED_APP_SCHEME_1_3);
         if (instanceScope) {
             mServiceManager.discardCurrentInstanceAndReselect("type 1.3 preplay_failure");
@@ -3622,6 +3641,82 @@ public class DvbIClient {
                 + (service != null ? service.getUniqueIdentifier() : aitUrl));
         mDvbIView.tuneOff();
         mTvInputCallback.tuneOffBroadcast();
+    }
+
+    private void cancelType13RetryRelaunch() {
+        mMainHandler.removeCallbacks(mType13RetryRunnable);
+        mType13RetryUid = null;
+    }
+
+    /**
+     * APPS0400 scenario (a): the service stays selected after service-level
+     * preplay_failure. SharedPreferences expire, but nothing re-enters the
+     * 1.3 gate unless we wake the instance after the hold.
+     */
+    private void scheduleType13RetryRelaunch(Service service, ServiceInstance instance,
+            String aitUrl) {
+        cancelType13RetryRelaunch();
+        long remaining = remainingType13RetryMs(service, instance, aitUrl);
+        if (remaining < 0L) {
+            return;
+        }
+        if (remaining == 0L) {
+            remaining = 1L; // spec: do not retry immediately, even for retry=0
+        }
+        mType13RetryUid = service != null ? service.getUniqueIdentifier() : null;
+        Log.i(TAG, "Type 1.3 retry relaunch in " + remaining + "ms uid=" + mType13RetryUid);
+        mMainHandler.postDelayed(mType13RetryRunnable, remaining);
+    }
+
+    /**
+     * @return remaining milliseconds, or {@code -1} if there is no finite hold
+     */
+    private long remainingType13RetryMs(Service service, ServiceInstance instance, String aitUrl) {
+        long inst = remainingRetryKeyMs(type13RetryKey(service, instance, aitUrl, true));
+        long svc = remainingRetryKeyMs(type13RetryKey(service, instance, aitUrl, false));
+        if (inst == Long.MAX_VALUE || svc == Long.MAX_VALUE) {
+            return -1L;
+        }
+        if (inst < 0L && svc < 0L) {
+            return -1L;
+        }
+        return Math.max(Math.max(inst, 0L), Math.max(svc, 0L));
+    }
+
+    /** @return remaining ms, {@link Long#MAX_VALUE} if infinite, or -1 if no hold */
+    private long remainingRetryKeyMs(String key) {
+        if (key == null || mDvbIView == null || mDvbIView.getContext() == null) {
+            return -1L;
+        }
+        SharedPreferences prefs = mDvbIView.getContext()
+                .getSharedPreferences("DvbIClient", Context.MODE_PRIVATE);
+        if (!prefs.contains(PREF_LA13_RETRY_UNTIL_PREFIX + key)) {
+            return -1L;
+        }
+        long until = prefs.getLong(PREF_LA13_RETRY_UNTIL_PREFIX + key, 0L);
+        if (until == Long.MAX_VALUE) {
+            return Long.MAX_VALUE;
+        }
+        return Math.max(0L, until - System.currentTimeMillis());
+    }
+
+    private synchronized void onType13RetryElapsed() {
+        Service service = mServiceManager.getTunedService();
+        if (service == null || mType13RetryUid == null
+                || !mType13RetryUid.equals(service.getUniqueIdentifier())) {
+            Log.i(TAG, "Type 1.3 retry elapsed; service no longer selected");
+            return;
+        }
+        ServiceInstance instance = mServiceManager.getTunedInstance();
+        if (isType13RetryHeld(service, instance, mPreplayAitUrl)) {
+            Log.i(TAG, "Type 1.3 retry elapsed but hold still active; rescheduling");
+            scheduleType13RetryRelaunch(service, instance, mPreplayAitUrl);
+            return;
+        }
+        Log.i(TAG, "Type 1.3 retry elapsed; reselecting uid=" + mType13RetryUid);
+        mPreplayState = PREPLAY_NONE;
+        mType13RetryUid = null;
+        mServiceManager.reselectAfterType13RetryHold();
     }
 
     private String queryPairsToJson(List<QueryPair> pairs) {
