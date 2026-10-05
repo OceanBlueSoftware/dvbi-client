@@ -16,6 +16,7 @@
         let _pendingEventPresenceChecks = [];
         let _playbackWatchdog = null;
         let _playingNotified = false;
+        let _manifestRequested = false;
         const PLAYER_EVENT_APP_SIGNALLING = "urn:dvb:dash:appsignalling:2016";
         const PLAYER_EVENT_EPG_METADATA = "urn:dvb:iptv:cpm:2014";
         const PLAYBACK_WATCHDOG_MS = 10000;
@@ -44,7 +45,9 @@
                 clearTimeout(_playbackWatchdog);
             }
             _playbackWatchdog = setTimeout(function() {
-                if (!_playingNotified) {
+                // Stay silent until dash.js has requested the service-list
+                // manifest URL (with any pre-play query already attached).
+                if (!_playingNotified && _manifestRequested) {
                     console.warn("Playback watchdog: firing PLAYING fallback");
                     _notifyPlaying('watchdog');
                 }
@@ -303,6 +306,7 @@
             _player.attachTTMLRenderingDiv(_subs);
 
             _player.on('manifestLoaded', function(e) {
+                _manifestRequested = true;
                 _onManifestLoaded(e);
                 _player.play();
             });
@@ -406,29 +410,24 @@
         }
         function orb_loadMedia(url, enableSubs) {
             _playingNotified = false;
-            if (_lastSource !== url) {
-                _lastSource = url;
-                for (const e in _events) {
-                    _events[e] = 0;
-                    _player.off(e, _streamEventHandler);
-                }
-                // Presence checks queued against the previous MPD must not be
-                // flushed when this source's manifestLoaded runs.
-                _manifestEventStreamsReady = false;
-                _pendingEventPresenceChecks = [];
-                _eventStreams = {};
-                _player.attachSource(url);
-                _player.play();
-                _startPlaybackWatchdog();
+            _manifestRequested = false;
+            _lastSource = url;
+            for (const e in _events) {
+                _events[e] = 0;
+                _player.off(e, _streamEventHandler);
             }
-            else {
-                if (_video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA) {
-                    _notifyPlaying('cached-source');
-                } else {
-                    _player.play();
-                    _startPlaybackWatchdog();
-                }
-            }
+            // Presence checks queued against the previous MPD must not be
+            // flushed when this source's manifestLoaded runs.
+            _manifestEventStreamsReady = false;
+            _pendingEventPresenceChecks = [];
+            _eventStreams = {};
+            // Always GET the service-list manifest URL. Replaying a cached
+            // source skips the request and the pre-play query never reaches
+            // the origin.
+            _player.attachSource(null);
+            _player.attachSource(url);
+            _player.play();
+            _startPlaybackWatchdog();
             _setTrackEnabled("video", true);
             _setTrackEnabled("audio", true);
             _setTrackEnabled("text", enableSubs);

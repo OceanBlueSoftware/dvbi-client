@@ -49,6 +49,8 @@ import java.io.StringReader;
 import java.net.HttpURLConnection;
 import java.net.URL;
 import java.time.Instant;
+import java.time.LocalDate;
+import java.time.ZoneOffset;
 import java.time.format.DateTimeParseException;
 import java.util.ArrayList;
 import java.util.Collections;
@@ -93,6 +95,10 @@ public class DvbIClient {
     private static final long EMPTY_RENEW_DEFAULT_WAIT_MS = 5_000L;
     private static final Pattern APPLICATION_LOCATION = Pattern.compile(
             "(?i)(<(?:[\\w.-]+:)?applicationLocation(?:\\s[^>]*)?>)([^<]*)(</(?:[\\w.-]+:)?applicationLocation>)");
+    private static final Pattern APPLICATION_ORG_ID = Pattern.compile(
+            "(?i)<(?:[\\w.-]+:)?orgId>(\\d+)</(?:[\\w.-]+:)?orgId>");
+    private static final Pattern APPLICATION_APP_ID = Pattern.compile(
+            "(?i)<(?:[\\w.-]+:)?appId>(\\d+)</(?:[\\w.-]+:)?appId>");
     private static final Pattern CACHE_MAX_AGE = Pattern.compile("(?i)max-age\\s*=\\s*(\\d+)");
 
     public static final String TYPE_DVB_I = "TYPE_DVB_I";
@@ -188,6 +194,7 @@ public class DvbIClient {
     private int mPreplayState = PREPLAY_NONE;
     private String mPreplayServiceUid;
     private String mPreplayAitUrl;
+    private String mPreplayAppIdentity;
     private boolean mPreplaySignalledOnInstance;
     private final Runnable mType13RetryRunnable = this::onType13RetryElapsed;
     private String mType13RetryUid;
@@ -475,6 +482,9 @@ public class DvbIClient {
                 // Player.stop is synchronous through decoder teardown. Tuner CLOSING
                 // may still run in the background; DASH does not need the frontend.
                 Log.i(TAG, "RF_TUNE_DEBUG: switching to DASH after tuneOffBroadcast");
+                mTracks.clear();
+                mSelectedTracks.clear();
+                mIsUnselected.clear();
                 mTvInputCallback.tuneOffBroadcast();
                 if (mPresentationSuspended) {
                     Log.i(TAG, "DECODER: deferring DASH until app releases decoders");
@@ -777,7 +787,7 @@ public class DvbIClient {
         } else if (mPreplayState == PREPLAY_RUNNING) {
             href = LINKED_APP_SCHEME_1_3;
         } else {
-            href = getInstanceHowRelatedHref(instance);
+            href = getFollowOnHowRelatedHref(service, instance);
         }
         Log.i(TAG, "HOW_RELATED: href=" + href + ", outside=" + outsideAvailability);
         final String publishedHref = href;
@@ -816,6 +826,22 @@ public class DvbIClient {
         }
         Log.w(TAG, "INSTANCE_ROUTE: dvb-dash location is not http(s): " + loc);
         return loc.startsWith("http") ? loc : null;
+    }
+
+    /**
+     * After pre-play, publish the same 1.2 / 1.1 href used to choose the
+     * follow-on app (service or instance RelatedMaterial).
+     */
+    private static String getFollowOnHowRelatedHref(Service service, ServiceInstance instance) {
+        if (instanceHasLinkedApp(instance, LINKED_APP_SCHEME_1_2)
+                || serviceHasLinkedApp(service, LINKED_APP_SCHEME_1_2)) {
+            return LINKED_APP_SCHEME_1_2;
+        }
+        if (instanceHasLinkedApp(instance, LINKED_APP_SCHEME_1_1)
+                || serviceHasLinkedApp(service, LINKED_APP_SCHEME_1_1)) {
+            return LINKED_APP_SCHEME_1_1;
+        }
+        return getInstanceHowRelatedHref(instance);
     }
 
     /** Instance-level 1.1 / 1.2 only; does not fall back to service-level type 2. */
@@ -1457,6 +1483,7 @@ public class DvbIClient {
         mPreplayState = PREPLAY_NONE;
         mPreplayServiceUid = null;
         mPreplayAitUrl = null;
+        mPreplayAppIdentity = null;
         mPreplayQueryPairs.clear();
         boolean blocked = mBlocked;
         mBlocked = false;
@@ -1583,6 +1610,7 @@ public class DvbIClient {
         mPreplayState = PREPLAY_NONE;
         mPreplayServiceUid = null;
         mPreplayAitUrl = null;
+        mPreplayAppIdentity = null;
         mPreplayQueryPairs.clear();
         mBlocked = false;
         mOverrideRequestPending = false;
@@ -1611,6 +1639,21 @@ public class DvbIClient {
         mDvbIView.setPresentationSuspended(suspend);
         if (!suspend) {
             startPendingNativePresentation();
+            // bindToCurrentChannel after DASH is already presenting (O.5.4):
+            // re-issue PLAYING so v/b can leave CONNECTING without treating an
+            // empty RF component list as "media available" before the MPD GET.
+            if (mPendingDashUri == null && PLAYER_STATUS_PLAYING.equals(mLastState)
+                    && !mBlocked) {
+                Triplet triplet = getHbbtvChannelStatusTriplet();
+                if (triplet != null) {
+                    dispatchPlayerStatusChangedEvent(
+                            triplet.getOrigNetId(), triplet.getTsId(), triplet.getServiceId(),
+                            PLAYER_STATUS_PLAYING);
+                    if (mTvInputCallback != null) {
+                        mTvInputCallback.notifyVideoAvailable();
+                    }
+                }
+            }
         }
     }
 
@@ -2342,6 +2385,16 @@ public class DvbIClient {
                 }
                 return;
             }
+            if (LINKED_APP_SCHEME_1_3.equals(result.scheme)
+                    || LINKED_APP_SCHEME_1_2.equals(result.scheme)
+                    || LINKED_APP_SCHEME_1_1.equals(result.scheme)) {
+                String identity = type13AppIdentity(result.xml);
+                if (identity != null && (mPreplayAppIdentity == null
+                        || LINKED_APP_SCHEME_1_3.equals(result.scheme))) {
+                    mPreplayAppIdentity = identity;
+                }
+                loadPersistedType13Query(result.url);
+            }
             result.xml = applyLaunchContextToXmlAit(result.xml, result.scheme);
             for (Callback cb : mCallbacks) {
                 cb.onProcessXmlAit(result.xml, result.scheme);
@@ -2830,8 +2883,10 @@ public class DvbIClient {
                 || LINKED_APP_SCHEME_4_2.equals(scheme)
                 || LINKED_APP_SCHEME_4_3.equals(scheme);
         boolean installQuery = type4x && !mInstallQueryPairs.isEmpty();
-        boolean preplayQuery = LINKED_APP_SCHEME_1_3.equals(scheme)
-                && !mPreplayQueryPairs.isEmpty();
+        boolean preplayQuery = !mPreplayQueryPairs.isEmpty()
+                && (LINKED_APP_SCHEME_1_3.equals(scheme)
+                || LINKED_APP_SCHEME_1_2.equals(scheme)
+                || LINKED_APP_SCHEME_1_1.equals(scheme));
         if (lloc == null && !installQuery && !preplayQuery) {
             return xml;
         }
@@ -2840,8 +2895,8 @@ public class DvbIClient {
         boolean found = false;
         while (matcher.find()) {
             found = true;
-            String location = matcher.group(2).trim();
-            if (lloc != null) {
+            String location = unescapeXmlText(matcher.group(2).trim());
+            if (lloc != null && !queryHasComponent(location, "lloc")) {
                 location = appendQueryComponent(location, "lloc", lloc);
             }
             if (installQuery) {
@@ -2872,6 +2927,17 @@ public class DvbIClient {
                 .replace(">", "&gt;")
                 .replace("\"", "&quot;")
                 .replace("'", "&apos;");
+    }
+
+    private static String unescapeXmlText(String text) {
+        if (text == null || text.isEmpty()) {
+            return text;
+        }
+        return text.replace("&lt;", "<")
+                .replace("&gt;", ">")
+                .replace("&quot;", "\"")
+                .replace("&apos;", "'")
+                .replace("&amp;", "&");
     }
 
     private static String llocForScheme(String scheme) {
@@ -2921,6 +2987,27 @@ public class DvbIClient {
             return url;
         }
         return appendQueryComponent(url, "installationtoken", mActiveInstallationToken);
+    }
+
+    private static boolean queryHasComponent(String url, String key) {
+        if (url == null || key == null || key.isEmpty()) {
+            return false;
+        }
+        int q = url.indexOf('?');
+        if (q < 0) {
+            return false;
+        }
+        int hash = url.indexOf('#');
+        String query = hash >= 0 ? url.substring(q + 1, hash) : url.substring(q + 1);
+        String encoded = Uri.encode(key);
+        for (String part : query.split("&")) {
+            int eq = part.indexOf('=');
+            String name = eq >= 0 ? part.substring(0, eq) : part;
+            if (key.equals(name) || encoded.equals(name)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private static String appendQueryComponent(String url, String key, String value) {
@@ -3391,12 +3478,22 @@ public class DvbIClient {
             try {
                 JSONObject params = new JSONObject(paramsJson != null ? paramsJson : "{}");
                 parseQueryInto(params, mPreplayQueryPairs);
-                persistType13Query(mPreplayAitUrl, mPreplayQueryPairs);
+                persistType13Query(mPreplayAppIdentity, mPreplayAitUrl, mPreplayQueryPairs);
                 JSONObject response = params.optJSONObject("application_response");
                 if (response != null && !response.isNull("persistent")) {
-                    storeType13Persistent(type13PersistKey(mPreplayServiceUid,
-                            mPreplaySignalledOnInstance ? mServiceManager.getTunedInstance() : null,
-                            mPreplayAitUrl), response.opt("persistent"));
+                    ServiceInstance scoped = mPreplaySignalledOnInstance
+                            ? mServiceManager.getTunedInstance() : null;
+                    Object persistent = response.opt("persistent");
+                    if (mPreplayAppIdentity != null && !mPreplayAppIdentity.isEmpty()) {
+                        storeType13Persistent(type13PersistKey(mPreplayServiceUid, scoped,
+                                mPreplayAppIdentity, null), persistent);
+                    }
+                    // tune() clears mPreplayAppIdentity. Keep an AIT-URL key so the
+                    // next selection of this application still finds the record.
+                    if (mPreplayAitUrl != null && !mPreplayAitUrl.isEmpty()) {
+                        storeType13Persistent(type13PersistKey(mPreplayServiceUid, scoped,
+                                null, mPreplayAitUrl), persistent);
+                    }
                 }
             } catch (JSONException e) {
                 Log.w(TAG, "Type 1.3 preplay_success params were not JSON");
@@ -3430,7 +3527,8 @@ public class DvbIClient {
         }
     }
 
-    private String type13PersistKey(String serviceUid, ServiceInstance instance, String aitUrl) {
+    private String type13PersistKey(String serviceUid, ServiceInstance instance,
+            String appIdentity, String aitUrl) {
         StringBuilder key = new StringBuilder();
         if (serviceUid != null) {
             key.append(serviceUid);
@@ -3438,10 +3536,32 @@ public class DvbIClient {
         if (instance != null && instance.getUri() != null) {
             key.append('|').append(instance.getUri());
         }
-        if (aitUrl != null) {
+        if (appIdentity != null && !appIdentity.isEmpty()) {
+            key.append("|app:").append(appIdentity);
+        } else if (aitUrl != null) {
             key.append('|').append(aitUrl);
         }
         return key.toString();
+    }
+
+    private static String type13AppIdentity(String xml) {
+        if (xml == null || xml.isEmpty()) {
+            return null;
+        }
+        Matcher org = APPLICATION_ORG_ID.matcher(xml);
+        Matcher app = APPLICATION_APP_ID.matcher(xml);
+        if (!org.find() || !app.find()) {
+            return null;
+        }
+        return org.group(1) + ":" + app.group(1);
+    }
+
+    private static String readType13PersistentValue(SharedPreferences prefs, String persistKey) {
+        if (prefs == null || persistKey == null || persistKey.isEmpty()) {
+            return null;
+        }
+        String value = prefs.getString(PREF_LA13_PERSIST_PREFIX + persistKey, null);
+        return (value == null || value.isEmpty()) ? null : value;
     }
 
     private void storeType13Persistent(String persistKey, Object persistent) {
@@ -3465,12 +3585,20 @@ public class DvbIClient {
         }
         SharedPreferences prefs = mDvbIView.getContext()
                 .getSharedPreferences("DvbIClient", Context.MODE_PRIVATE);
-        String persistKey = type13PersistKey(service.getUniqueIdentifier(),
-                instanceHasLinkedApp(instance, LINKED_APP_SCHEME_1_3) ? instance : null, aitUrl);
-        String value = prefs.getString(PREF_LA13_PERSIST_PREFIX + persistKey, null);
-        if (value == null) {
-            persistKey = type13PersistKey(service.getUniqueIdentifier(), null, aitUrl);
-            value = prefs.getString(PREF_LA13_PERSIST_PREFIX + persistKey, null);
+        ServiceInstance scoped = instanceHasLinkedApp(instance, LINKED_APP_SCHEME_1_3)
+                ? instance : null;
+        String uid = service.getUniqueIdentifier();
+        String value = readType13PersistentValue(prefs, type13PersistKey(uid, scoped,
+                mPreplayAppIdentity, aitUrl));
+        if (value == null && mPreplayAppIdentity != null) {
+            value = readType13PersistentValue(prefs, type13PersistKey(uid, scoped,
+                    mPreplayAppIdentity, null));
+        }
+        if (value == null && aitUrl != null && !aitUrl.isEmpty()) {
+            value = readType13PersistentValue(prefs, type13PersistKey(uid, scoped, null, aitUrl));
+        }
+        if (value == null && aitUrl != null && !aitUrl.isEmpty()) {
+            value = readType13PersistentValue(prefs, type13PersistKey(uid, null, null, aitUrl));
         }
         if (value == null || value.isEmpty()) {
             return false;
@@ -3478,12 +3606,36 @@ public class DvbIClient {
         if ("forever".equalsIgnoreCase(value)) {
             return true;
         }
-        try {
-            Instant until = Instant.parse(value);
-            return Instant.now().isBefore(until);
-        } catch (DateTimeParseException e) {
+        Instant until = parseType13PersistentInstant(value);
+        if (until == null) {
             Log.w(TAG, "Type 1.3 persistent date was not ISO-8601: " + value);
             return false;
+        }
+        return Instant.now().isBefore(until);
+    }
+
+    /** Instant, or a calendar date (ISO 8601-1) meaning persist through that UTC day. */
+    private static Instant parseType13PersistentInstant(String value) {
+        if (value == null) {
+            return null;
+        }
+        String trimmed = value.trim();
+        try {
+            return Instant.parse(trimmed);
+        } catch (DateTimeParseException ignored) {
+        }
+        if (!trimmed.endsWith("Z") && !trimmed.contains("+") && trimmed.length() >= 19
+                && trimmed.charAt(10) == 'T') {
+            try {
+                return Instant.parse(trimmed + "Z");
+            } catch (DateTimeParseException ignored) {
+            }
+        }
+        try {
+            LocalDate date = LocalDate.parse(trimmed);
+            return date.plusDays(1).atStartOfDay().toInstant(ZoneOffset.UTC);
+        } catch (DateTimeParseException ignored) {
+            return null;
         }
     }
 
@@ -3497,6 +3649,7 @@ public class DvbIClient {
         mPreplayState = PREPLAY_NONE;
         mPreplayServiceUid = null;
         mPreplayAitUrl = null;
+        mPreplayAppIdentity = null;
         mPreplayQueryPairs.clear();
         if (mDvbIView == null || mDvbIView.getContext() == null) {
             return;
@@ -3520,25 +3673,33 @@ public class DvbIClient {
         }
     }
 
-    private void persistType13Query(String aitUrl, List<QueryPair> pairs) {
-        if (aitUrl == null || aitUrl.isEmpty()) {
-            return;
-        }
+    private void persistType13Query(String appIdentity, String aitUrl, List<QueryPair> pairs) {
         SharedPreferences prefs = mDvbIView.getContext()
                 .getSharedPreferences("DvbIClient", Context.MODE_PRIVATE);
-        prefs.edit().putString(PREF_LA13_QUERY_PREFIX + aitUrl, queryPairsToJson(pairs)).apply();
+        SharedPreferences.Editor editor = prefs.edit();
+        String json = queryPairsToJson(pairs);
+        if (appIdentity != null && !appIdentity.isEmpty()) {
+            editor.putString(PREF_LA13_QUERY_PREFIX + "app:" + appIdentity, json);
+        }
+        if (aitUrl != null && !aitUrl.isEmpty()) {
+            editor.putString(PREF_LA13_QUERY_PREFIX + aitUrl, json);
+        }
+        editor.apply();
     }
 
     private void loadPersistedType13Query(String aitUrl) {
-        if (aitUrl == null || aitUrl.isEmpty()) {
-            return;
-        }
         if (!mPreplayQueryPairs.isEmpty()) {
             return;
         }
         SharedPreferences prefs = mDvbIView.getContext()
                 .getSharedPreferences("DvbIClient", Context.MODE_PRIVATE);
-        String json = prefs.getString(PREF_LA13_QUERY_PREFIX + aitUrl, null);
+        String json = null;
+        if (mPreplayAppIdentity != null && !mPreplayAppIdentity.isEmpty()) {
+            json = prefs.getString(PREF_LA13_QUERY_PREFIX + "app:" + mPreplayAppIdentity, null);
+        }
+        if ((json == null || json.isEmpty()) && aitUrl != null && !aitUrl.isEmpty()) {
+            json = prefs.getString(PREF_LA13_QUERY_PREFIX + aitUrl, null);
+        }
         if (json == null || json.isEmpty()) {
             return;
         }
