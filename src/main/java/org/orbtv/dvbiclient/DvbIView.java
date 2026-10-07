@@ -130,6 +130,14 @@ public class DvbIView extends WebView {
         getSettings().setMediaPlaybackRequiresUserGesture(false);
         getSettings().setLoadWithOverviewMode(true);
         getSettings().setDomStorageEnabled(true);
+        getSettings().setAllowFileAccess(true);
+        getSettings().setAllowContentAccess(true);
+        // file:///android_asset player must be allowed to GET http(s) MPDs.
+        getSettings().setAllowUniversalAccessFromFileURLs(true);
+        getSettings().setAllowFileAccessFromFileURLs(true);
+        // dash.js must request the manifest URL from the service list (with
+        // any pre-play query already attached) instead of replaying a cache.
+        getSettings().setCacheMode(WebSettings.LOAD_NO_CACHE);
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
             getSettings().setMixedContentMode(WebSettings.MIXED_CONTENT_ALWAYS_ALLOW);
         }
@@ -162,7 +170,8 @@ public class DvbIView extends WebView {
                 Log.i(TAG, "onPageFinished " + url + "...");
                 if (DVBI_PAGE.equals(url)) {
                     synchronized (mPageLoaded) {
-                        evaluateJavascript("orb_loadMedia('" + mLastUrl + "', " + mSubsEnabled + ")", null);
+                        evaluateJavascript("orb_loadMedia(" + JSONObject.quote(mLastUrl)
+                                + ", " + mSubsEnabled + ")", null);
                         mPageLoaded = true;
                         applyVideoRectangleJs();
                         mSuppressVideoEvents = false;
@@ -243,7 +252,8 @@ public class DvbIView extends WebView {
                         this.clearFocus();
                     }
                     if (Boolean.TRUE.equals(mPageLoaded) && DVBI_PAGE.equals(this.getUrl())) {
-                        evaluateJavascript("orb_loadMedia('" + mLastUrl + "', " + enableSubs + ")", null);
+                        evaluateJavascript("orb_loadMedia(" + JSONObject.quote(mLastUrl)
+                                + ", " + enableSubs + ")", null);
                         mSuppressVideoEvents = false;
                     } else {
                         mPageLoaded = false;
