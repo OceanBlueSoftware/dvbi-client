@@ -215,7 +215,7 @@ public class DvbIClient {
     private GetXmlAitTask mType4xAitTask;
     private final Executor mIoExecutor = Executors.newSingleThreadExecutor();
     private final Runnable mRenewPollRunnable = this::runRenewUrlPoll;
-    private final Runnable mLaunchType43Runnable = this::launchType43App;
+    private final Runnable mLaunchType43Runnable = this::runScheduledType43Launch;
     private final Runnable mRenewDeadlineExpired = this::onRenewDeadlineExpired;
     /** App-pinned instance is outside its Availability Period; ignore DASH PLAYING until it returns. */
     private volatile boolean mPinnedInstanceOutsideWindow = false;
@@ -1220,6 +1220,9 @@ public class DvbIClient {
     public synchronized void registerCallback(Callback handler) {
         if (!mCallbacks.contains(handler)) {
             mCallbacks.add(handler);
+            if (handler != null && handler.canLaunchLinkedApp()) {
+                mMainHandler.post(this::maybeLaunchDeferredType43);
+            }
         }
     }
 
@@ -1821,6 +1824,9 @@ public class DvbIClient {
             Log.w(TAG, "Cancelling in-progress type 4.1 install gate to start a new search");
             cancelType41InstallGate();
         }
+        // A new list install replaces any leftover 4.3 from a previous UID.
+        mType43AppRunning = false;
+        mMainHandler.removeCallbacks(mLaunchType43Runnable);
         ServiceListDiscoveryTask previous = mLastDiscoveryTask;
         mLastDiscoveryTask = new ServiceListDiscoveryTask(mDiscoveryEpoch);
         if (previous != null) {
@@ -2557,6 +2563,9 @@ public class DvbIClient {
         }
         publishHowRelated(scheme);
         if (html || isHtmlLinkedAppUrl(url, html)) {
+            if (!hasLinkedAppCallback()) {
+                Log.w(TAG, "No linked-app host for scheme=" + scheme);
+            }
             String launchUrl = appendQueryComponent(url, "lloc", lloc);
             launchUrl = applyInstallQuery(launchUrl);
             launchUrl = applyInstallationToken(launchUrl, scheme);
@@ -2773,6 +2782,13 @@ public class DvbIClient {
         }
         mActiveListUid = list.getUID();
         captureType4xLocators(list);
+        // Previous list's 4.3 is no longer this install. Do not keep the
+        // "already presenting" flag or that list's renew deadline.
+        mType43AppRunning = false;
+        mLastRenewFailed = false;
+        mRenewDeadlineMs = -1L;
+        mMainHandler.removeCallbacks(mLaunchType43Runnable);
+        mMainHandler.removeCallbacks(mRenewDeadlineExpired);
         SharedPreferences prefs = mDvbIView.getContext().getSharedPreferences("DvbIClient", Context.MODE_PRIVATE);
         Set<String> done = new HashSet<>(prefs.getStringSet(PREF_LA41_COMPLETED_UIDS, Collections.emptySet()));
         done.add(list.getUID());
@@ -3027,6 +3043,20 @@ public class DvbIClient {
     public boolean hasType42LinkedApp() {
         return mType42Uri != null && !mType42Uri.isEmpty()
                 && mActiveListUid != null && !isConsentWithdrawn(mActiveListUid);
+    }
+
+    /**
+     * Type 4.3 is launched from the Setup host after renewurl returns a time.
+     * Setup must stay up until that app can run; OrbProvider is not bound then.
+     */
+    public boolean hasPendingType43Renewal() {
+        return mType43Uri != null && !mType43Uri.isEmpty()
+                && mActiveRenewUrl != null && !mActiveRenewUrl.isEmpty()
+                && mActiveListUid != null && !isConsentWithdrawn(mActiveListUid);
+    }
+
+    public boolean shouldHoldInstallationUi() {
+        return hasType42LinkedApp() || hasPendingType43Renewal() || mType43AppRunning;
     }
 
     /**
@@ -3348,12 +3378,36 @@ public class DvbIClient {
     private void scheduleType43Launch(long whenMs) {
         mMainHandler.removeCallbacks(mLaunchType43Runnable);
         mMainHandler.removeCallbacks(mRenewDeadlineExpired);
-        if (!launchType43App()) {
+        if (mType43Uri == null || mType43Uri.isEmpty() || isConsentWithdrawn(mActiveListUid)) {
             withdrawConsent();
             return;
         }
         long delayMs = Math.max(0, whenMs - System.currentTimeMillis());
+        mMainHandler.postDelayed(mLaunchType43Runnable, delayMs);
         mMainHandler.postDelayed(mRenewDeadlineExpired, delayMs);
+    }
+
+    private void runScheduledType43Launch() {
+        if (!launchType43App()) {
+            withdrawConsent();
+        }
+    }
+
+    /**
+     * Restore / ISO time can schedule 4.3 before Setup has a host. Launch then,
+     * instead of keeping {@link #mType43AppRunning} set with no browser.
+     */
+    private void maybeLaunchDeferredType43() {
+        if (mType43AppRunning || mRenewDeadlineMs <= 0) {
+            return;
+        }
+        if (mType43Uri == null || mType43Uri.isEmpty() || isConsentWithdrawn(mActiveListUid)) {
+            return;
+        }
+        if (!hasLinkedAppCallback()) {
+            return;
+        }
+        scheduleType43Launch(mRenewDeadlineMs);
     }
 
     private void onRenewDeadlineExpired() {
@@ -3367,17 +3421,22 @@ public class DvbIClient {
         withdrawConsent();
     }
 
-    /** @return true if a 4.3 app is presenting or was just launched */
+    /** @return true if a 4.3 app is presenting, was launched, or is waiting for a host */
     private boolean launchType43App() {
         if (isConsentWithdrawn(mActiveListUid)) {
             return false;
         }
-        if (mType43AppRunning) {
-            return true;
-        }
         if (mType43Uri == null || mType43Uri.isEmpty()) {
             Log.i(TAG, "renewurl time received but no type 4.3 app is signalled");
             return false;
+        }
+        if (mType43AppRunning && hasLinkedAppCallback()) {
+            return true;
+        }
+        if (!hasLinkedAppCallback()) {
+            mType43AppRunning = false;
+            Log.w(TAG, "Type 4.3 deferred: no linked-app host");
+            return true;
         }
         mType43AppRunning = true;
         Log.i(TAG, "Launching type 4.3 renewal app");
