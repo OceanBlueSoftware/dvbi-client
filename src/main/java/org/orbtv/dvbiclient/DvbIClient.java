@@ -87,6 +87,7 @@ public class DvbIClient {
     private static final String PREF_LA43_CTYPE_PREFIX = "dvbi_la43_ctype:";
     private static final String PREF_LA_DEADLINE_PREFIX = "dvbi_la_deadline:";
     private static final String PREF_LA_RENEW_FAILED_PREFIX = "dvbi_la_renew_failed:";
+    private static final String PREF_LA_AWAITING_TIME_PREFIX = "dvbi_la_awaiting_time:";
     private static final String PREF_LA13_PERSIST_PREFIX = "dvbi_la13_persist:";
     private static final String PREF_LA13_QUERY_PREFIX = "dvbi_la13_query:";
     private static final String PREF_LA13_RETRY_UNTIL_PREFIX = "dvbi_la13_retry_until:";
@@ -220,6 +221,8 @@ public class DvbIClient {
     private boolean mAwaitingRenewTimeDocument;
     private boolean mLastRenewFailed;
     private int mRenewPollRetry;
+    /** Bumped to drop in-flight renewurl results after search / credential change. */
+    private int mRenewEpoch;
     private GetXmlAitTask mType4xAitTask;
     private final Executor mIoExecutor = Executors.newSingleThreadExecutor();
     private final Runnable mRenewPollRunnable = this::runRenewUrlPoll;
@@ -1833,8 +1836,7 @@ public class DvbIClient {
             cancelType41InstallGate();
         }
         // A new list install replaces any leftover 4.3 from a previous UID.
-        clearType43PresentationState();
-        mAwaitingRenewTimeDocument = false;
+        invalidateRenewalCycle();
         ServiceListDiscoveryTask previous = mLastDiscoveryTask;
         mLastDiscoveryTask = new ServiceListDiscoveryTask(mDiscoveryEpoch);
         if (previous != null) {
@@ -2290,6 +2292,9 @@ public class DvbIClient {
                 commitPendingServiceList();
                 finalizeSearch();
                 startRenewUrlPolling(0);
+                if (mRenewDeadlineMs > 0) {
+                    scheduleType43Launch(mRenewDeadlineMs);
+                }
             } else if (type41 != null) {
                 startType41InstallGate(type41);
             } else {
@@ -2563,11 +2568,11 @@ public class DvbIClient {
                 useDiscoveryEpoch);
     }
 
-    private void launchLinkedApp(String url, boolean html, String scheme, String lloc,
+    private boolean launchLinkedApp(String url, boolean html, String scheme, String lloc,
             boolean useDiscoveryEpoch) {
         if (url == null || url.isEmpty()) {
             Log.w(TAG, "Linked app URL missing scheme=" + scheme);
-            return;
+            return false;
         }
         publishHowRelated(scheme);
         if (html || isHtmlLinkedAppUrl(url, html)) {
@@ -2577,9 +2582,11 @@ public class DvbIClient {
             String launchUrl = appendQueryComponent(url, "lloc", lloc);
             launchUrl = applyInstallQuery(launchUrl);
             launchUrl = applyInstallationToken(launchUrl, scheme);
+            boolean presented = false;
             for (Callback cb : mCallbacks) {
-                cb.onLaunchHtmlLinkedApp(launchUrl, scheme);
+                presented |= cb.onLaunchHtmlLinkedApp(launchUrl, scheme);
             }
+            return presented;
         } else {
             if (mType4xAitTask != null) {
                 mType4xAitTask.cancel(true);
@@ -2596,6 +2603,7 @@ public class DvbIClient {
             int generation = LINKED_APP_SCHEME_4_1.equals(scheme) ? mTuneGeneration : -1;
             int epoch = useDiscoveryEpoch ? mDiscoveryEpoch : -1;
             task.execute(new XmlAitAttributes(url, scheme, generation, epoch));
+            return true;
         }
     }
 
@@ -2740,6 +2748,7 @@ public class DvbIClient {
         mActiveInstallationToken = prefs.getString(PREF_LA_TOKEN_PREFIX + uid, null);
         mRenewDeadlineMs = prefs.getLong(PREF_LA_DEADLINE_PREFIX + uid, -1L);
         mLastRenewFailed = prefs.getBoolean(PREF_LA_RENEW_FAILED_PREFIX + uid, false);
+        mAwaitingRenewTimeDocument = prefs.getBoolean(PREF_LA_AWAITING_TIME_PREFIX + uid, false);
     }
 
     private void parseInstallQuery(JSONObject params) {
@@ -2806,6 +2815,7 @@ public class DvbIClient {
                 .putString(PREF_LA41_QUERY_PREFIX + list.getUID(), queryPairsToJson())
                 .putString(PREF_LA_ACTIVE_UID, list.getUID());
         promotePendingCredentialsToActive();
+        mRenewEpoch++;
         mAwaitingRenewTimeDocument = hasType43Locator() && mActiveRenewUrl != null
                 && !mActiveRenewUrl.isEmpty();
         persistLinkedAppCredentials(editor, list.getUID());
@@ -2836,6 +2846,7 @@ public class DvbIClient {
             editor.remove(PREF_LA_DEADLINE_PREFIX + uid);
         }
         editor.putBoolean(PREF_LA_RENEW_FAILED_PREFIX + uid, mLastRenewFailed);
+        editor.putBoolean(PREF_LA_AWAITING_TIME_PREFIX + uid, mAwaitingRenewTimeDocument);
     }
 
     private static void putPrefOrRemove(SharedPreferences.Editor editor, String key, String value) {
@@ -3082,6 +3093,15 @@ public class DvbIClient {
         mMainHandler.removeCallbacks(mRenewDeadlineExpired);
     }
 
+    /** Drop live 4.3 scheduling and in-flight polls. Persisted deadline is reloaded on skip-install. */
+    private void invalidateRenewalCycle() {
+        mRenewEpoch++;
+        stopRenewUrlPolling();
+        clearType43PresentationState();
+        mAwaitingRenewTimeDocument = false;
+        mRenewDeadlineMs = -1L;
+    }
+
     /**
      * Platform UI for TS 103 770 §5.2.3.6.3: run the type 4.2 linked application
      * with {@code lloc=withdrawal-of-agreement}.
@@ -3222,9 +3242,16 @@ public class DvbIClient {
         }
         final String url = mActiveRenewUrl;
         final String token = mActiveInstallationToken;
+        final int epoch = mRenewEpoch;
         mIoExecutor.execute(() -> {
             RenewPollResult result = fetchRenewUrl(url, token);
-            mMainHandler.post(() -> handleRenewPollResult(result));
+            mMainHandler.post(() -> {
+                if (epoch != mRenewEpoch) {
+                    Log.i(TAG, "Ignoring stale renewurl poll after search or credential change");
+                    return;
+                }
+                handleRenewPollResult(result);
+            });
         });
     }
 
@@ -3393,13 +3420,19 @@ public class DvbIClient {
     }
 
     private void onRenewTimeSignalled(long whenMs) {
+        boolean later = whenMs > mRenewDeadlineMs;
         mRenewDeadlineMs = whenMs;
         mLastRenewFailed = false;
         mAwaitingRenewTimeDocument = false;
         persistActiveCredentials();
         Log.i(TAG, "renewurl signalled time " + Instant.ofEpochMilli(whenMs));
-        // Polling of that renewurl continues until the 4.3 app exits (§5.2.3.6.2).
-        scheduleType43Launch(whenMs);
+        if (!mType43AppRunning) {
+            scheduleType43Launch(whenMs);
+        } else if (later) {
+            armRenewDeadline();
+        }
+        // §5.2.3.6.2: keep GET-ing until the 4.3 application exits.
+        startRenewUrlPolling(EMPTY_RENEW_DEFAULT_WAIT_MS);
     }
 
     private void scheduleType43Launch(long whenMs) {
@@ -3420,7 +3453,9 @@ public class DvbIClient {
             withdrawConsent();
             return;
         }
-        if (mType43AppRunning) {
+        // Keep the signalled time as the renew_failure re-run window.
+        // Do not arm a same-instant withdraw at launch.
+        if (mType43AppRunning && mRenewDeadlineMs > System.currentTimeMillis()) {
             armRenewDeadline();
         }
     }
@@ -3480,11 +3515,18 @@ public class DvbIClient {
             Log.w(TAG, "Type 4.3 deferred: no linked-app host");
             return true;
         }
-        mType43AwaitingHost = false;
-        mType43AppRunning = true;
         Log.i(TAG, "Launching type 4.3 renewal app");
         boolean html = isHtmlContentType(mType43ContentType) || isHtmlLinkedAppUrl(mType43Uri, false);
-        launchLinkedApp(mType43Uri, html, LINKED_APP_SCHEME_4_3, "renewal-of-agreement", false);
+        boolean presented = launchLinkedApp(mType43Uri, html, LINKED_APP_SCHEME_4_3,
+                "renewal-of-agreement", false);
+        if (!presented) {
+            mType43AppRunning = false;
+            mType43AwaitingHost = true;
+            Log.w(TAG, "Type 4.3 deferred: host did not present");
+            return true;
+        }
+        mType43AwaitingHost = false;
+        mType43AppRunning = true;
         return true;
     }
 
@@ -3546,6 +3588,7 @@ public class DvbIClient {
             return;
         }
         Log.i(TAG, "Consent withdrawn for list UID " + uid);
+        mRenewEpoch++;
         stopAllRenewTimers();
         mType42AppRunning = false;
         mType43AppRunning = false;
@@ -3568,6 +3611,7 @@ public class DvbIClient {
         editor.remove(PREF_LA_TOKEN_PREFIX + uid);
         editor.remove(PREF_LA_DEADLINE_PREFIX + uid);
         editor.remove(PREF_LA_RENEW_FAILED_PREFIX + uid);
+        editor.remove(PREF_LA_AWAITING_TIME_PREFIX + uid);
         editor.apply();
         mDbHandler.deleteServiceList(uid);
         mEpgManager.refreshServiceLists();
@@ -4098,7 +4142,8 @@ public class DvbIClient {
         /** Override when this host can launch HTML / XML AIT linked applications. */
         protected boolean canLaunchLinkedApp() { return false; }
         protected void onProcessXmlAit(String xmlAit, String scheme) { }
-        protected void onLaunchHtmlLinkedApp(String url, String scheme) { }
+        /** @return true if this host actually presented the application */
+        protected boolean onLaunchHtmlLinkedApp(String url, String scheme) { return false; }
         protected void onApplicationHowRelatedHrefChanged(String href) { }
         /** Consent withdrawn or renewal failed after the deadline: return to Setup. */
         protected void onReturnToInstallationUi() { }
