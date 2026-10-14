@@ -3307,6 +3307,12 @@ public class DvbIClient {
             connection.setConnectTimeout(10000);
             connection.setReadTimeout(10000);
             connection.setInstanceFollowRedirects(true);
+            // Official 0130–0150 count server GETs. HttpURLConnection would
+            // otherwise reuse the first empty max-age=30s body and never see
+            // the later ISO time, so type 4.3 never launches.
+            connection.setUseCaches(false);
+            connection.setRequestProperty("Cache-Control", "no-cache");
+            connection.setRequestProperty("Pragma", "no-cache");
             int code = connection.getResponseCode();
             String contentType = connection.getContentType();
             String cacheControl = connection.getHeaderField("Cache-Control");
