@@ -1835,8 +1835,9 @@ public class DvbIClient {
             Log.w(TAG, "Cancelling in-progress type 4.1 install gate to start a new search");
             cancelType41InstallGate();
         }
-        // A new list install replaces any leftover 4.3 from a previous UID.
+        // A new list install replaces leftover 4.2 / 4.3 from a previous UID.
         invalidateRenewalCycle();
+        clearType4xLaunchLocators();
         ServiceListDiscoveryTask previous = mLastDiscoveryTask;
         mLastDiscoveryTask = new ServiceListDiscoveryTask(mDiscoveryEpoch);
         if (previous != null) {
@@ -2564,8 +2565,12 @@ public class DvbIClient {
             Log.w(TAG, "No linked app to launch scheme=" + scheme);
             return;
         }
-        launchLinkedApp(app.getMediaLocatorUri(), app.isGenericHtmlContentType(), scheme, lloc,
-                useDiscoveryEpoch);
+        boolean type4x = LINKED_APP_SCHEME_4_1.equals(scheme)
+                || LINKED_APP_SCHEME_4_2.equals(scheme)
+                || LINKED_APP_SCHEME_4_3.equals(scheme);
+        String url = type4x ? app.getType4xLaunchUri() : app.getMediaLocatorUri();
+        boolean html = type4x ? app.isType4xHtml() : app.isGenericHtmlContentType();
+        launchLinkedApp(url, html, scheme, lloc, useDiscoveryEpoch);
     }
 
     private boolean launchLinkedApp(String url, boolean html, String scheme, String lloc,
@@ -2616,7 +2621,8 @@ public class DvbIClient {
         if (q >= 0) {
             path = path.substring(0, q);
         }
-        return path.endsWith(".html") || path.endsWith(".htm") || path.endsWith(".xhtml");
+        return path.endsWith(".html") || path.endsWith(".htm")
+                || path.endsWith(".xhtml") || path.endsWith(".html5");
     }
 
     private void publishHowRelated(String href) {
@@ -2827,10 +2833,11 @@ public class DvbIClient {
     private void captureType4xLocators(ServiceList list) {
         RelatedMaterial type42 = findLinkedApp(list, LINKED_APP_SCHEME_4_2);
         RelatedMaterial type43 = findLinkedApp(list, LINKED_APP_SCHEME_4_3);
-        mType42Uri = type42 != null ? type42.getMediaLocatorUri() : null;
-        mType42ContentType = type42 != null ? type42.getMediaLocatorContentType() : null;
-        mType43Uri = type43 != null ? type43.getMediaLocatorUri() : null;
-        mType43ContentType = type43 != null ? type43.getMediaLocatorContentType() : null;
+        mType42Uri = type42 != null ? type42.getType4xLaunchUri() : null;
+        mType42ContentType = type42 != null ? type42.getType4xLaunchContentType() : null;
+        mType43Uri = type43 != null ? type43.getType4xLaunchUri() : null;
+        mType43ContentType = type43 != null ? type43.getType4xLaunchContentType() : null;
+        Log.i(TAG, "Type 4.x locators 4.2=" + mType42Uri + " 4.3=" + mType43Uri);
     }
 
     private void persistLinkedAppCredentials(SharedPreferences.Editor editor, String uid) {
@@ -3093,6 +3100,15 @@ public class DvbIClient {
         mMainHandler.removeCallbacks(mRenewDeadlineExpired);
     }
 
+    /** Drop 4.2 / 4.3 locators until the new list's 4.1 success captures them. */
+    private void clearType4xLaunchLocators() {
+        mType42AppRunning = false;
+        mType42Uri = null;
+        mType42ContentType = null;
+        mType43Uri = null;
+        mType43ContentType = null;
+    }
+
     /** Drop live 4.3 scheduling and in-flight polls. Persisted deadline is reloaded on skip-install. */
     private void invalidateRenewalCycle() {
         mRenewEpoch++;
@@ -3118,7 +3134,11 @@ public class DvbIClient {
         mType42AppRunning = true;
         Log.i(TAG, "Launching type 4.2 consent withdrawal app");
         boolean html = isHtmlContentType(mType42ContentType) || isHtmlLinkedAppUrl(mType42Uri, false);
-        launchLinkedApp(mType42Uri, html, LINKED_APP_SCHEME_4_2, "withdrawal-of-agreement", false);
+        if (!launchLinkedApp(mType42Uri, html, LINKED_APP_SCHEME_4_2, "withdrawal-of-agreement", false)) {
+            mType42AppRunning = false;
+            Log.w(TAG, "Type 4.2 withdrawal app did not start");
+            return false;
+        }
         return true;
     }
 
@@ -3158,15 +3178,15 @@ public class DvbIClient {
                     if (mType42Uri == null) {
                         RelatedMaterial type42 = findLinkedApp(list, LINKED_APP_SCHEME_4_2);
                         if (type42 != null) {
-                            mType42Uri = type42.getMediaLocatorUri();
-                            mType42ContentType = type42.getMediaLocatorContentType();
+                            mType42Uri = type42.getType4xLaunchUri();
+                            mType42ContentType = type42.getType4xLaunchContentType();
                         }
                     }
                     if (mType43Uri == null) {
                         RelatedMaterial type43 = findLinkedApp(list, LINKED_APP_SCHEME_4_3);
                         if (type43 != null) {
-                            mType43Uri = type43.getMediaLocatorUri();
-                            mType43ContentType = type43.getMediaLocatorContentType();
+                            mType43Uri = type43.getType4xLaunchUri();
+                            mType43ContentType = type43.getType4xLaunchContentType();
                         }
                     }
                     break;
