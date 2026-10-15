@@ -27,6 +27,10 @@ public class RelatedMaterial {
     private String mHowRelatedHref;
     private String mMediaLocatorUri;
     private String mMediaLocatorContentType;
+    private String mHtmlLocatorUri;
+    private String mHtmlLocatorContentType;
+    private String mAitLocatorUri;
+    private String mAitLocatorContentType;
 
     private RelatedMaterial() { }
 
@@ -34,35 +38,95 @@ public class RelatedMaterial {
         return mHowRelatedHref;
     }
 
-    public String getMediaLocatorUri() { return mMediaLocatorUri; }
+    /**
+     * Service-instance / 1.x launch URI. When HTML and XML AIT are both
+     * signalled, the AIT wins so {@link org.orbtv.dvbiclient.DvbIChannelAdapter}
+     * still finds the HbbTV application.
+     */
+    public String getMediaLocatorUri() {
+        if (mAitLocatorUri != null && !mAitLocatorUri.isEmpty()) {
+            return mAitLocatorUri;
+        }
+        if (mHtmlLocatorUri != null && !mHtmlLocatorUri.isEmpty()) {
+            return mHtmlLocatorUri;
+        }
+        return mMediaLocatorUri;
+    }
 
     public String getMediaLocatorContentType() {
+        if (mAitLocatorUri != null && !mAitLocatorUri.isEmpty()) {
+            return mAitLocatorContentType;
+        }
+        if (mHtmlLocatorUri != null && !mHtmlLocatorUri.isEmpty()) {
+            return mHtmlLocatorContentType;
+        }
         return mMediaLocatorContentType;
     }
 
+    /**
+     * Type 4.x install / withdraw / renew. Official lists signal generic HTML
+     * and an XML AIT in one RelatedMaterial; Setup already hosts HTML 4.1, so
+     * prefer that locator when both are present.
+     */
+    public String getType4xLaunchUri() {
+        if (mHtmlLocatorUri != null && !mHtmlLocatorUri.isEmpty()) {
+            return mHtmlLocatorUri;
+        }
+        return getMediaLocatorUri();
+    }
+
+    public String getType4xLaunchContentType() {
+        if (mHtmlLocatorUri != null && !mHtmlLocatorUri.isEmpty()) {
+            return mHtmlLocatorContentType != null ? mHtmlLocatorContentType : "text/html";
+        }
+        return getMediaLocatorContentType();
+    }
+
+    public boolean isType4xHtml() {
+        return isHtmlContentType(getType4xLaunchContentType())
+                || isHtmlLocatorUri(getType4xLaunchUri());
+    }
+
     public boolean isXmlAitContentType() {
-        return "application/vnd.dvb.ait+xml".equals(mMediaLocatorContentType);
+        return "application/vnd.dvb.ait+xml".equalsIgnoreCase(getMediaLocatorContentType());
     }
 
     /** HbbTV Annex O.3 generic HTML (not an HbbTV XML AIT). */
     public boolean isGenericHtmlContentType() {
-        return "text/html".equalsIgnoreCase(mMediaLocatorContentType)
-                || "application/xhtml+xml".equalsIgnoreCase(mMediaLocatorContentType);
+        return isHtmlContentType(getMediaLocatorContentType());
+    }
+
+    private static boolean isHtmlContentType(String contentType) {
+        return "text/html".equalsIgnoreCase(contentType)
+                || "application/xhtml+xml".equalsIgnoreCase(contentType);
+    }
+
+    private static boolean isHtmlLocatorUri(String uri) {
+        if (uri == null) {
+            return false;
+        }
+        String path = uri.toLowerCase();
+        int q = path.indexOf('?');
+        if (q >= 0) {
+            path = path.substring(0, q);
+        }
+        return path.endsWith(".html") || path.endsWith(".htm")
+                || path.endsWith(".xhtml") || path.endsWith(".html5");
     }
 
     @Override
     public String toString() {
         return "- " + this.getClass().getSimpleName() + " -\n"
                 + "howRelatedHref: " + this.mHowRelatedHref + "\n"
-                + "mediaLocatorContentType: " + this.mMediaLocatorContentType + "\n"
-                + "mediaLocatorUri: " + this.mMediaLocatorUri;
+                + "mediaLocatorContentType: " + this.getMediaLocatorContentType() + "\n"
+                + "mediaLocatorUri: " + this.getMediaLocatorUri();
     }
 
     public ContentValues toContentValues() {
         ContentValues values = new ContentValues();
         values.put(RelatedMaterial.DB_COLUMN_HOW_RELATED_HREF, mHowRelatedHref);
-        values.put(RelatedMaterial.DB_COLUMN_MEDIA_LOCATOR_URI, mMediaLocatorUri);
-        values.put(RelatedMaterial.DB_COLUMN_MEDIA_LOCATOR_CONTENT_TYPE, mMediaLocatorContentType);
+        values.put(RelatedMaterial.DB_COLUMN_MEDIA_LOCATOR_URI, getMediaLocatorUri());
+        values.put(RelatedMaterial.DB_COLUMN_MEDIA_LOCATOR_CONTENT_TYPE, getMediaLocatorContentType());
         return values;
     }
 
@@ -79,7 +143,8 @@ public class RelatedMaterial {
                         parseMediaLocator(xpp, relatedMaterial);
                         break;
                     case "MediaUri":
-                        relatedMaterial.mMediaLocatorContentType = xpp.getAttributeValue(null, "contentType");
+                        relatedMaterial.mMediaLocatorContentType =
+                                xpp.getAttributeValue(null, "contentType");
                         break;
                 }
             }
@@ -88,12 +153,32 @@ public class RelatedMaterial {
         return relatedMaterial;
     }
 
+    private void applyLocator(String uri, String contentType) {
+        if (uri != null && !uri.isEmpty()) {
+            mMediaLocatorUri = uri;
+        }
+        if (contentType != null && !contentType.isEmpty()) {
+            mMediaLocatorContentType = contentType;
+        }
+        if (isHtmlContentType(contentType) || isHtmlLocatorUri(uri)) {
+            if (mHtmlLocatorUri == null || mHtmlLocatorUri.isEmpty()) {
+                mHtmlLocatorUri = uri;
+                mHtmlLocatorContentType = contentType != null ? contentType : "text/html";
+            }
+        }
+        if ("application/vnd.dvb.ait+xml".equalsIgnoreCase(contentType)) {
+            mAitLocatorUri = uri;
+            mAitLocatorContentType = contentType;
+        }
+    }
+
     private static void parseMediaLocator(XmlPullParser xpp, RelatedMaterial relatedMaterial) throws Exception {
         int eventType = xpp.next();
         while (!(eventType == XmlPullParser.END_TAG && "MediaLocator".equals(xpp.getName()))) {
             if (eventType == XmlPullParser.START_TAG && "MediaUri".equals(xpp.getName())) {
-                relatedMaterial.mMediaLocatorContentType = xpp.getAttributeValue(null, "contentType");
-                relatedMaterial.mMediaLocatorUri = xpp.nextText();
+                String contentType = xpp.getAttributeValue(null, "contentType");
+                String uri = xpp.nextText();
+                relatedMaterial.applyLocator(uri, contentType);
             }
             eventType = xpp.next();
         }
@@ -119,8 +204,7 @@ public class RelatedMaterial {
         public RelatedMaterial build() {
             RelatedMaterial instance = new RelatedMaterial();
             instance.mHowRelatedHref = mInstance.mHowRelatedHref;
-            instance.mMediaLocatorUri = mInstance.mMediaLocatorUri;
-            instance.mMediaLocatorContentType = mInstance.mMediaLocatorContentType;
+            instance.applyLocator(mInstance.mMediaLocatorUri, mInstance.mMediaLocatorContentType);
             return instance;
         }
     }
