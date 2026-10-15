@@ -13,7 +13,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
- 
+
 package org.orbtv.dvbiclient;
 
 import android.content.Context;
@@ -1700,17 +1700,14 @@ public class DvbIClient {
     }
 
     public void setVideoRectangle(int x, int y, int width, int height) {
-        String deliveryType = "";
-        try {
-            deliveryType = mServiceManager.getTunedInstance().getDeliveryType();
+        ServiceInstance instance = mServiceManager.getTunedInstance();
+        if (instance == null || !"dvb-dash".equals(instance.getDeliveryType())) {
+            return;
         }
-        catch (NullPointerException e) { }
-        if (deliveryType.equals("dvb-dash")) {
-            Log.i(TAG, "Setting video rectangle to " + x + ", " + y + ", " + width + ", " + height);
-            mDvbIView.setVideoRectangle(x, y, width, height);
-            for (DvbCallback handler : mDvbCallbacks) {
-                handler.onSetVideoRectangle(x, y, width, height);
-            }
+        Log.i(TAG, "Setting video rectangle to " + x + ", " + y + ", " + width + ", " + height);
+        mDvbIView.setVideoRectangle(x, y, width, height);
+        for (DvbCallback handler : mDvbCallbacks) {
+            handler.onSetVideoRectangle(x, y, width, height);
         }
     }
 
