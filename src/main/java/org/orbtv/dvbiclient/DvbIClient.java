@@ -2919,18 +2919,16 @@ public class DvbIClient {
     /**
      * §5.2.3.6: lloc and success query pairs belong on AIT applicationLocation
      * (and DASH MPD URLs), not on the XML AIT fetch URL.
-     * Type 4.1 install query stays on 4.x only. Raw {@code &} in the location
-     * must be escaped or libxml2 rejects the rewritten AIT (APPS0300+).
+     * Install pairs are appended before any other application's pairs.
+     * Raw {@code &} in the location must be escaped or libxml2 rejects the
+     * rewritten AIT (APPS0300+).
      */
     private String applyLaunchContextToXmlAit(String xml, String scheme) {
         if (xml == null) {
             return null;
         }
         String lloc = llocForScheme(scheme);
-        boolean type4x = LINKED_APP_SCHEME_4_1.equals(scheme)
-                || LINKED_APP_SCHEME_4_2.equals(scheme)
-                || LINKED_APP_SCHEME_4_3.equals(scheme);
-        boolean installQuery = type4x && !mInstallQueryPairs.isEmpty();
+        boolean installQuery = !mInstallQueryPairs.isEmpty();
         boolean preplayQuery = !mPreplayQueryPairs.isEmpty()
                 && (LINKED_APP_SCHEME_1_3.equals(scheme)
                 || LINKED_APP_SCHEME_1_2.equals(scheme)
