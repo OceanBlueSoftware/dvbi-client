@@ -544,7 +544,11 @@ public class EpgManager {
                     }
                     mTaskInfo.isNowNext = true;
                 }
-                mUpdatedServices.add(mTaskInfo.getServiceUID());
+                // Many metadata tasks run at once. ArrayList.add is not thread-safe;
+                // a concurrent add corrupts size and kills the TV input process.
+                synchronized (mLock) {
+                    mUpdatedServices.add(mTaskInfo.getServiceUID());
+                }
             }
             return programmes;
         }
