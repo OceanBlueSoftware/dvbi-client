@@ -3142,6 +3142,141 @@ public class DvbIClient {
         return true;
     }
 
+    /**
+     * A stored service list. {@link #getUid()} is the list URL used at install.
+     * {@link #getLabel()} is the filename, for the setup screen.
+     */
+    public static final class InstalledServiceList {
+        private final String mUid;
+        private final String mLabel;
+
+        InstalledServiceList(String uid, String label) {
+            mUid = uid;
+            mLabel = label;
+        }
+
+        public String getUid() {
+            return mUid;
+        }
+
+        public String getLabel() {
+            return mLabel;
+        }
+
+        @Override
+        public String toString() {
+            return mLabel;
+        }
+    }
+
+    /** @return true when at least one service list is stored, including a withdrawn list. */
+    public boolean hasInstalledServiceLists() {
+        return !getInstalledServiceLists().isEmpty();
+    }
+
+    public List<InstalledServiceList> getInstalledServiceLists() {
+        List<InstalledServiceList> installed = new ArrayList<>();
+        List<ServiceList> lists = mDbHandler.getServiceLists();
+        if (lists == null) {
+            return installed;
+        }
+        for (ServiceList list : lists) {
+            String uid = list.getUID();
+            if (uid == null || uid.isEmpty()) {
+                continue;
+            }
+            installed.add(new InstalledServiceList(uid, labelForServiceList(uid)));
+        }
+        return installed;
+    }
+
+    /**
+     * Delete one stored service list and its services. Does not run the type 4.2
+     * withdrawal application. Clears that list's install-completion state so a later
+     * scan runs its type 4.1 gate again.
+     *
+     * @return true when that list was stored and has been removed
+     */
+    public boolean removeInstalledServiceList(String uid) {
+        if (uid == null || uid.isEmpty()) {
+            return false;
+        }
+        boolean found = false;
+        List<ServiceList> lists = mDbHandler.getServiceLists();
+        if (lists != null) {
+            for (ServiceList list : lists) {
+                if (uid.equals(list.getUID())) {
+                    found = true;
+                    break;
+                }
+            }
+        }
+        if (!found) {
+            return false;
+        }
+        if (mPendingServiceList != null && uid.equals(mPendingServiceList.getUID())) {
+            cancelServiceSearch();
+        }
+        mDbHandler.deleteServiceList(uid);
+        SharedPreferences prefs = mDvbIView.getContext().getSharedPreferences("DvbIClient", Context.MODE_PRIVATE);
+        SharedPreferences.Editor editor = prefs.edit();
+        for (String key : new HashSet<>(prefs.getAll().keySet())) {
+            if (key.endsWith(uid)) {
+                editor.remove(key);
+            }
+        }
+        Set<String> completed = new HashSet<>(prefs.getStringSet(PREF_LA41_COMPLETED_UIDS, Collections.emptySet()));
+        completed.remove(uid);
+        Set<String> withdrawn = new HashSet<>(prefs.getStringSet(PREF_LA_WITHDRAWN_UIDS, Collections.emptySet()));
+        withdrawn.remove(uid);
+        editor.putStringSet(PREF_LA41_COMPLETED_UIDS, completed);
+        editor.putStringSet(PREF_LA_WITHDRAWN_UIDS, withdrawn);
+        if (uid.equals(prefs.getString(PREF_LA_ACTIVE_UID, null))) {
+            editor.remove(PREF_LA_ACTIVE_UID);
+        }
+        if (uid.equals(prefs.getString(PREF_DVBI_SERVICE_LIST_URL, null))) {
+            editor.remove(PREF_DVBI_SERVICE_LIST_URL);
+            editor.remove(PREF_DVBI_SERVICE_LIST_VERSION);
+        }
+        editor.apply();
+        if (uid.equals(mActiveListUid)) {
+            stopAllRenewTimers();
+            mActiveListUid = null;
+            mActiveRenewUrl = null;
+            mActiveInstallationToken = null;
+            mPendingRenewUrl = null;
+            mPendingInstallationToken = null;
+            mType42Uri = null;
+            mType42ContentType = null;
+            mType43Uri = null;
+            mType43ContentType = null;
+            mRenewDeadlineMs = -1L;
+            mType42AppRunning = false;
+            mType43AppRunning = false;
+            mLastRenewFailed = false;
+        }
+        mEpgManager.refreshServiceLists();
+        Log.i(TAG, "Removed installed service list " + uid);
+        for (DvbCallback handler : mDvbCallbacks) {
+            handler.onServiceDeleted();
+        }
+        return true;
+    }
+
+    private static String labelForServiceList(String uid) {
+        String path = uid;
+        int query = path.indexOf('?');
+        if (query >= 0) {
+            path = path.substring(0, query);
+        }
+        int slash = path.lastIndexOf('/');
+        if (slash >= 0 && slash + 1 < path.length()) {
+            path = path.substring(slash + 1);
+        }
+        String decoded = Uri.decode(path);
+        return decoded == null || decoded.isEmpty() ? uid : decoded;
+    }
+
     public boolean isConsentWithdrawn() {
         return isConsentWithdrawn(mActiveListUid);
     }
