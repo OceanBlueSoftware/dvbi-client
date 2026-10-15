@@ -1847,50 +1847,59 @@ public class DvbIClient {
             // Default to HbbTV test harness service list URL for test environment
             serviceListURL = "http://hbbtv1.test/servicelist.xml";
         }
+        mCurrentServiceListUrl = serviceListURL;
         Log.d(TAG, "Starting service search at " + serviceListURL);
         mLastDiscoveryTask.execute(serviceListURL);
         return true;
     }
 
     /**
-     * Update the DVB-I service list if the version has changed.
-     * Per TS 103 770, the @version attribute is incremented for each change in the data.
-     * This method checks the version before reloading to avoid unnecessary updates.
-     *
-     * @param serviceListURL URL to the service list XML, or null to use default
-     * @return true if service list was updated or is being updated, false if version unchanged or error
+     * Reload {@code serviceListURL} only when that same URL already has a stored version
+     * and the published version is different. A new URL, a missing URL, and a version
+     * that cannot be read leave the installed list in place. The check runs off the
+     * caller thread. Returns false so the caller can sync the services already stored;
+     * a later reload syncs again after it commits.
      */
     public boolean updateServiceList(String serviceListURL) {
         if (serviceListURL == null || serviceListURL.isEmpty()) {
-            // Default to HbbTV test harness service list URL for test environment
-            serviceListURL = "http://hbbtv1.test/servicelist.xml";
+            Log.d(TAG, "No installed DVB-I service list URL, skipping refresh");
+            return false;
         }
-
-        // Get current version from service list
-        String currentVersion = getServiceListVersion(serviceListURL);
-        if (currentVersion == null) {
-            // Could not determine version, reload to be safe
-            Log.d(TAG, "Could not determine DVB-I service list version, reloading to ensure latest data");
-            return startServiceSearch(serviceListURL);
+        if (mInstallGateActive || mLastDiscoveryTask != null) {
+            Log.d(TAG, "Service list search already in progress, skipping version refresh");
+            return false;
         }
-
-        // Check stored version
         SharedPreferences prefs = mDvbIView.getContext().getSharedPreferences("DvbIClient", Context.MODE_PRIVATE);
         String lastKnownVersion = prefs.getString(PREF_DVBI_SERVICE_LIST_VERSION, null);
         String lastKnownUrl = prefs.getString(PREF_DVBI_SERVICE_LIST_URL, null);
-
-        if (lastKnownVersion == null || !currentVersion.equals(lastKnownVersion) ||
-            !serviceListURL.equals(lastKnownUrl)) {
-            Log.d(TAG, String.format("DVB-I service list version changed from %s to %s, reloading",
-                lastKnownVersion, currentVersion));
-            // Store URL and version to save after successful load
-            mCurrentServiceListUrl = serviceListURL;
-            boolean started = startServiceSearch(serviceListURL);
-            return started;
-        } else {
-            Log.d(TAG, String.format("DVB-I service list version unchanged (%s), skipping reload", currentVersion));
+        if (lastKnownVersion == null || !serviceListURL.equals(lastKnownUrl)) {
+            Log.d(TAG, "No stored version for installed service list, leaving it unchanged");
             return false;
         }
+        final String installedVersion = lastKnownVersion;
+        mIoExecutor.execute(() -> refreshServiceListIfVersionChanged(serviceListURL, installedVersion));
+        return false;
+    }
+
+    private void refreshServiceListIfVersionChanged(String serviceListURL, String installedVersion) {
+        String currentVersion = getServiceListVersion(serviceListURL);
+        if (currentVersion == null) {
+            Log.d(TAG, "Could not determine DVB-I service list version, leaving installed list unchanged");
+            return;
+        }
+        if (currentVersion.equals(installedVersion)) {
+            Log.d(TAG, String.format("DVB-I service list version unchanged (%s), skipping reload", currentVersion));
+            return;
+        }
+        Log.d(TAG, String.format("DVB-I service list version changed from %s to %s, reloading",
+                installedVersion, currentVersion));
+        mMainHandler.post(() -> {
+            if (mInstallGateActive || mLastDiscoveryTask != null) {
+                Log.d(TAG, "Service list search started while version was checked, skipping reload");
+                return;
+            }
+            startServiceSearch(serviceListURL);
+        });
     }
 
     /**
@@ -3172,6 +3181,24 @@ public class DvbIClient {
     /** @return true when at least one service list is stored, including a withdrawn list. */
     public boolean hasInstalledServiceLists() {
         return !getInstalledServiceLists().isEmpty();
+    }
+
+    /**
+     * URL of the list whose version can be refreshed. Prefers the URL saved at install.
+     * A single stored list is used when that preference is missing. Several stored lists
+     * and no saved URL have no single list to refresh.
+     */
+    public String getInstalledServiceListUrl() {
+        SharedPreferences prefs = mDvbIView.getContext().getSharedPreferences("DvbIClient", Context.MODE_PRIVATE);
+        String url = prefs.getString(PREF_DVBI_SERVICE_LIST_URL, null);
+        if (url != null && !url.isEmpty()) {
+            return url;
+        }
+        List<InstalledServiceList> lists = getInstalledServiceLists();
+        if (lists.size() == 1) {
+            return lists.get(0).getUid();
+        }
+        return null;
     }
 
     public List<InstalledServiceList> getInstalledServiceLists() {
