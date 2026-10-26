@@ -258,6 +258,8 @@ public class DvbIClient {
     private String mPendingDashUri;
     /** Last native DASH MPD (no 4.1/4.3 query). 4.3 tuneOff clears the current instance. */
     private String mLastNativeDashUri;
+    /** True while the last presented service was that native DASH, including after 4.3 tuneOff. */
+    private boolean mLastPresentationWasNativeDash;
     /**
      * Set by {@link #mServiceManagerCallback}. Re-shows the PIN dialog when a tune finds the
      * terminal already on a service that is still parentally blocked and the dialog was dismissed.
@@ -323,6 +325,7 @@ public class DvbIClient {
                     } else {
                         if (dashUri != null) {
                             mLastNativeDashUri = dashUri;
+                            mLastPresentationWasNativeDash = true;
                             loadPersistedType13Query(channel.getLinkedAppUri(LINKED_APP_SCHEME_1_3));
                             uri = applyInstallQuery(dashUri);
                         }
@@ -535,6 +538,7 @@ public class DvbIClient {
             } else {
                 Log.i(TAG, "RF_TUNE_DEBUG: switching to broadcast instance, deliveryType="
                     + toInstance.getDeliveryType() + ", mLastState=" + mLastState);
+                mLastPresentationWasNativeDash = false;
                 mDvbIView.tuneOff();
                 mTracks.clear();
                 mSelectedTracks.clear();
@@ -599,6 +603,7 @@ public class DvbIClient {
                 + ", blocked=" + blocked);
             // Linked app controlling media: terminal does not start DASH itself.
             clearPendingNativePresentation();
+            mLastPresentationWasNativeDash = false;
             mTvInputCallback.tuneOffBroadcast();
             mDvbIView.tuneOff();
             if (blocked) {
@@ -3069,6 +3074,10 @@ public class DvbIClient {
         editor.putBoolean(PREF_LA43_SUCCEEDED_PREFIX + uid, mType43RenewSucceeded);
     }
 
+    private static boolean persistNow(SharedPreferences.Editor editor) {
+        return editor.commit();
+    }
+
     private static void putPrefOrRemove(SharedPreferences.Editor editor, String key, String value) {
         if (value == null || value.isEmpty()) {
             editor.remove(key);
@@ -3382,6 +3391,7 @@ public class DvbIClient {
         mRenewPollRetry = 0;
         mRenewDeadlineMs = -1L;
         mNextRenewPollAtWallMs = 0L;
+        mRenewCacheUntilWallMs = 0L;
     }
 
     /**
@@ -3653,10 +3663,13 @@ public class DvbIClient {
             return;
         }
         if (mType43Presented || mType43RenewSucceeded) {
+            /* Standby freezes the uptime deadline. Do not let it fire after
+             * wake and withdrawConsent() the stored list. */
+            mMainHandler.removeCallbacks(mRenewDeadlineExpired);
             return;
         }
         if (mLastRenewFailed) {
-            if (mRenewDeadlineMs > 0) {
+            if (mRenewDeadlineMs > 0 && System.currentTimeMillis() < mRenewDeadlineMs) {
                 armRenewDeadline();
             }
             return;
@@ -3703,6 +3716,7 @@ public class DvbIClient {
         mType43AppRunning = false;
         if (mType43Presented) {
             Log.i(TAG, "Type 4.3 host gone after the app was shown — not relaunching");
+            mMainHandler.removeCallbacks(mRenewDeadlineExpired);
             return;
         }
         if (!hasLinkedAppCallback()) {
@@ -3743,6 +3757,8 @@ public class DvbIClient {
         mNextRenewPollAtWallMs = System.currentTimeMillis() + waitMs;
         persistNextRenewPollTime();
         if (mRenewPollInFlight) {
+            /* Next-poll time is already persisted. The in-flight GET must
+             * reschedule if its result is dropped (epoch change). */
             return;
         }
         mMainHandler.removeCallbacks(mRenewPollRunnable);
@@ -3760,7 +3776,7 @@ public class DvbIClient {
         } else {
             editor.remove(PREF_LA_NEXT_POLL_PREFIX + mActiveListUid);
         }
-        editor.apply();
+        persistNow(editor);
     }
 
     private void stopRenewUrlPolling() {
@@ -3787,6 +3803,9 @@ public class DvbIClient {
                 mRenewPollInFlight = false;
                 if (epoch != mRenewEpoch) {
                     Log.i(TAG, "Ignoring stale renewurl poll after search or credential change");
+                    if (mActiveRenewUrl != null && !isConsentWithdrawn(mActiveListUid)) {
+                        startRenewUrlPolling(remainingRenewPollDelayMs());
+                    }
                     return;
                 }
                 handleRenewPollResult(result);
@@ -3976,30 +3995,35 @@ public class DvbIClient {
 
     private void onRenewTimeSignalled(long whenMs) {
         long now = System.currentTimeMillis();
-        if (mLastRenewFailed && whenMs <= now) {
+        if (whenMs > now) {
+            mLastRenewFailed = false;
+        } else if (mLastRenewFailed) {
             Log.i(TAG, "renewurl time is in the past after renew_failure — withdrawing consent");
             withdrawConsent();
             return;
         }
         mAwaitingRenewTimeDocument = false;
         // APPS0130–0150 serve now+120s on every poll after the first. That is
-        // the same renewal, not a new deadline. Keep the first time and launch
-        // before it (TS 103 770 §5.2.3.6.2).
+        // the same renewal, not a new deadline. Keep the first time (TS 103 770
+        // §5.2.3.6.2 launches at that signalled time, not immediately).
         if (mRenewDeadlineMs <= 0) {
             mRenewDeadlineMs = whenMs;
-            persistActiveCredentials();
-            if (mType43RenewSucceeded || mType43Presented) {
-                Log.i(TAG, "renewurl signalled time " + Instant.ofEpochMilli(whenMs)
-                        + " — polling only, 4.3 already ran this install");
-            } else if (!mType43AppRunning) {
-                Log.i(TAG, "renewurl signalled time " + Instant.ofEpochMilli(whenMs)
-                        + " — launching type 4.3");
-                scheduleType43Launch(now);
-            }
         } else {
             Log.i(TAG, "renewurl time " + Instant.ofEpochMilli(whenMs)
                     + " ignored; keeping first deadline "
                     + Instant.ofEpochMilli(mRenewDeadlineMs));
+        }
+        persistActiveCredentials();
+        if (mType43RenewSucceeded || mType43Presented) {
+            Log.i(TAG, "renewurl signalled time " + Instant.ofEpochMilli(whenMs)
+                    + " — polling only, 4.3 already ran this install");
+        } else if (!mType43AppRunning) {
+            Log.i(TAG, "renewurl first deadline " + Instant.ofEpochMilli(mRenewDeadlineMs)
+                    + " — scheduling type 4.3");
+            scheduleType43Launch(mRenewDeadlineMs);
+            if (!hasType43Locator()) {
+                mMainHandler.postDelayed(this::maybeLaunchDeferredType43, 1000);
+            }
         }
         // §5.2.3.6.2: keep GET-ing until the 4.3 application exits.
         startRenewUrlPolling(EMPTY_RENEW_DEFAULT_WAIT_MS);
@@ -4064,6 +4088,9 @@ public class DvbIClient {
         if (isConsentWithdrawn(mActiveListUid)) {
             return;
         }
+        if (mType43Presented || mType43RenewSucceeded) {
+            return;
+        }
         if (mType43AppRunning || mType43AwaitingHost) {
             // Presenting, or still waiting for Setup/OrbProvider to attach.
             return;
@@ -4119,7 +4146,7 @@ public class DvbIClient {
                 .putString(PREF_LA_ACTIVE_UID, mActiveListUid)
                 .putString(PREF_LA41_QUERY_PREFIX + mActiveListUid, queryPairsToJson());
         persistLinkedAppCredentials(editor, mActiveListUid);
-        editor.apply();
+        persistNow(editor);
     }
 
     private void handleConsentOrRenewCompletion(String method, String paramsJson) {
@@ -4183,8 +4210,8 @@ public class DvbIClient {
             return;
         }
         String dashUri = mLastNativeDashUri;
-        if (dashUri == null || dashUri.isEmpty()) {
-            Log.i(TAG, "4.3 query replacement: no DASH instance to refresh");
+        if (!mLastPresentationWasNativeDash || dashUri == null || dashUri.isEmpty()) {
+            Log.i(TAG, "4.3 query replacement: last presentation was not this DASH");
             return;
         }
         String uri = applyInstallQuery(dashUri);
@@ -4215,6 +4242,7 @@ public class DvbIClient {
         mNextRenewPollAtWallMs = 0L;
         mRenewCacheUntilWallMs = 0L;
         mType43RenewSucceeded = false;
+        mType43Presented = false;
         SharedPreferences prefs = mDvbIView.getContext().getSharedPreferences("DvbIClient", Context.MODE_PRIVATE);
         Set<String> withdrawn = new HashSet<>(prefs.getStringSet(PREF_LA_WITHDRAWN_UIDS, Collections.emptySet()));
         withdrawn.add(uid);
@@ -4229,7 +4257,9 @@ public class DvbIClient {
         editor.remove(PREF_LA_NEXT_POLL_PREFIX + uid);
         editor.remove(PREF_LA_RENEW_FAILED_PREFIX + uid);
         editor.remove(PREF_LA_AWAITING_TIME_PREFIX + uid);
-        editor.apply();
+        editor.remove(PREF_LA43_PRESENTED_PREFIX + uid);
+        editor.remove(PREF_LA43_SUCCEEDED_PREFIX + uid);
+        persistNow(editor);
         mDbHandler.deleteServiceList(uid);
         mEpgManager.refreshServiceLists();
         for (DvbCallback handler : mDvbCallbacks) {
