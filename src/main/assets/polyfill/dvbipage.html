@@ -40,6 +40,10 @@
         let _textAppliedOn = false;
         let _textAppliedId = null;
         let _applyingText = false;
+        // dash id chosen by selectComponent. Terminal language preference must
+        // not replace it while that Adaptation Set is still in the Period.
+        let _explicitTextId = null;
+        let _deferTextPreference = false;
         const PLAYER_EVENT_APP_SIGNALLING = "urn:dvb:dash:appsignalling:2016";
         const PLAYER_EVENT_EPG_METADATA = "urn:dvb:iptv:cpm:2014";
         const PLAYBACK_WATCHDOG_MS = 10000;
@@ -205,6 +209,28 @@
             _applyingText = true;
             try {
                 const tracks = _player.getTracksFor('text') || [];
+                if (_explicitTextId !== null) {
+                    const still = tracks.some(function (tr) {
+                        return String(tr.id) === String(_explicitTextId);
+                    });
+                    if (still) {
+                        return;
+                    }
+                    // Adaptation Set left this Period. dash.js reports the
+                    // loss; do not immediately pick the terminal language.
+                    _explicitTextId = null;
+                    _deferTextPreference = true;
+                    return;
+                }
+                if (_deferTextPreference) {
+                    if (!tracks.length) {
+                        return;
+                    }
+                    _deferTextPreference = false;
+                    if (_player.getCurrentTrackFor('text')) {
+                        return;
+                    }
+                }
                 console.log("DASH_SUBS apply enabled=" + _subsEnabled +
                     " lang=" + _preferredSubLang + " tracks=" + tracks.length);
                 if (!_subsEnabled) {
@@ -439,7 +465,10 @@
             _player.updateSettings({
                 streaming: {
                     retryAttempts: 5,
-                    retryIntervals: 500
+                    retryIntervals: 500,
+                    gaps: {
+                        jumpLargeGaps: false
+                    }
                 }
             });
             _player.initialize(_video, undefined, true);
@@ -559,6 +588,8 @@
             }
             _textAppliedOn = false;
             _textAppliedId = null;
+            _explicitTextId = null;
+            _deferTextPreference = false;
             for (const e in _events) {
                 _events[e] = 0;
                 _player.off(e, _streamEventHandler);
@@ -581,6 +612,18 @@
         }
 
         function orb_setSubtitles(enabled, lang) {
+            if (_explicitTextId !== null && _player) {
+                const tracks = _player.getTracksFor('text') || [];
+                const still = tracks.some(function (tr) {
+                    return String(tr.id) === String(_explicitTextId);
+                });
+                if (still) {
+                    console.log("DASH_SUBS orb_setSubtitles ignored; application text track "
+                        + _explicitTextId);
+                    return;
+                }
+            }
+            _deferTextPreference = false;
             _subsEnabled = !!enabled;
             if (lang !== undefined && lang !== null) {
                 _preferredSubLang = lang;
@@ -593,7 +636,10 @@
             if (type === 'text') {
                 if (id !== undefined && id !== null) {
                     _subsEnabled = true;
+                    _explicitTextId = String(id);
+                    _deferTextPreference = false;
                 } else {
+                    _explicitTextId = null;
                     _subsEnabled = false;
                 }
             }
